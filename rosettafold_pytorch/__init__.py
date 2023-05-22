@@ -1,0 +1,1 @@
+from rosettafold_pytorch.rosettafold_pytorch import RoseTTAFold
