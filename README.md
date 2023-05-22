@@ -1,5 +1,7 @@
 # rosettafold-pytorch
 
+[![Lightning](https://img.shields.io/badge/Lightning-792EE5?style=flat&logo=PyTorch%20Lightning&logoColor=white)](https://www.pytorchlightning.ai/)
+
 ![img](img/rosettafold_banner.png)
 
 An unofficial re-implementation of RoseTTAFold, a three-track deep learning model for protein structure prediction.
