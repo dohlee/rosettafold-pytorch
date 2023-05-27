@@ -2,8 +2,19 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 import pytorch_lightning as pl
+
+from einops import rearrange
+from einops.layers.torch import Rearrange
+
+
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x) + x
 
 
 def sinusoidal_positional_encoding(max_len, d_emb):
@@ -38,6 +49,41 @@ class MSAEmbedding(nn.Module):
         # x : B, N, L
         x = self.to_embedding(x) + pe + qe
         return x  # B, N, L, d_emb
+
+
+class PositionWiseWeightFactor(nn.Module):
+    def __init__(self, d_emb=384, n_heads=12, p_dropout=0.1):
+        super().__init__()
+
+        assert (
+            d_emb % n_heads == 0
+        ), f"[{self.__class__.__name__}]: d_emb ({d_emb}) must be divisible by n_heads ({n_heads})."
+
+        self.d_head = d_emb // n_heads
+        self.scale = self.d_head ** (-0.5)
+
+        self.to_q = nn.Sequential(
+            nn.Linear(d_emb, d_emb),  # IDEA: maybe we can use LinearNoBias here.
+            Rearrange("b n l (h d) -> b l h n d", h=n_heads),
+        )
+        self.to_k = nn.Sequential(
+            nn.Linear(d_emb, d_emb),  # IDEA: maybe we can use LinearNoBias here.
+            Rearrange("b m l (h d) -> b l h m d", h=n_heads),
+        )
+        self.dropout = nn.Dropout(p_dropout)
+
+    def forward(self, msa_emb):
+        """msa : (B, N, L, d_emb)"""
+        query_seq = msa_emb[:, 0].unsqueeze(1)  # Take the first sequence as query.
+
+        q = self.to_q(query_seq) * self.scale
+        k = self.to_k(msa_emb)
+
+        logits = torch.einsum("b l h n d, b l h m d -> b l h n m", q, k)
+        # IDEA: maybe we can use dropout here at logits to make weights sum to 1.
+        att = logits.softmax(dim=-1)
+
+        return self.dropout(att)
 
 
 class RoseTTAFold(pl.LightningModule):

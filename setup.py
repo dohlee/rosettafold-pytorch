@@ -21,6 +21,7 @@ setup(
     'einops>=0.3',
     'numpy',
     'torch>=1.6',
+    'performer-pytorch',
   ],
   classifiers=[
     'Development Status :: 4 - Beta',
