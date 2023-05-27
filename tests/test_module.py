@@ -7,6 +7,7 @@ warnings.filterwarnings("ignore")
 from rosettafold_pytorch.rosettafold_pytorch import (
     MSAEmbedding,
     PositionWiseWeightFactor,
+    SoftTiedAttentionOverResidues,
 )
 
 
@@ -63,7 +64,7 @@ def test_PositionWiseWeightFactor_shape():
         d_emb=d_emb, n_heads=n_heads, p_dropout=0.1
     )
 
-    assert pos_wise_weight_factor(msa_emb).shape == (bsz, max_len, n_heads, 1, n_seq)
+    assert pos_wise_weight_factor(msa_emb).shape == (bsz, n_seq, n_heads, max_len, 1)
 
 
 def test_PositionWiseWeightFactor_sums_to_1():
@@ -82,7 +83,42 @@ def test_PositionWiseWeightFactor_sums_to_1():
 
     assert (
         pos_wise_weight_factor(msa_emb)
-        .sum(dim=-1)
+        .sum(dim=1)
         .squeeze()
-        .allclose(torch.ones((bsz, max_len, n_heads)))
+        .allclose(torch.ones((bsz, n_heads, max_len)))
     )
+
+
+# SoftTiedAttentionOverResidues
+def test_SoftTiedAttentionOverResidues_init():
+    bsz, n_seq, max_len = 4, 10, 5000
+    d_emb, n_heads, max_len = 64, 4, 32
+
+    msa = torch.randint(0, 21, (bsz, n_seq, max_len))
+    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_emb = msa_embedder(msa)
+
+    att = SoftTiedAttentionOverResidues(
+        d_emb=d_emb,
+        n_heads=n_heads,
+        p_dropout=0.0,  # Make sure that no dropout is applied in this test
+    )
+
+    assert att is not None
+
+
+def test_SoftTiedAttentionOverResidues_shape():
+    bsz, n_seq, max_len = 4, 10, 5000
+    d_emb, n_heads, max_len = 64, 4, 32
+
+    msa = torch.randint(0, 21, (bsz, n_seq, max_len))
+    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_emb = msa_embedder(msa)
+
+    att = SoftTiedAttentionOverResidues(
+        d_emb=d_emb,
+        n_heads=n_heads,
+        p_dropout=0.0,  # Make sure that no dropout is applied in this test
+    )
+
+    assert att(msa_emb).shape == (bsz, n_seq, max_len, d_emb)

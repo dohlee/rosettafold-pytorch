@@ -6,6 +6,7 @@ import pytorch_lightning as pl
 
 from einops import rearrange
 from einops.layers.torch import Rearrange
+from performer_pytorch import SelfAttention as PerformerSelfAttention
 
 
 class Residual(nn.Module):
@@ -64,11 +65,11 @@ class PositionWiseWeightFactor(nn.Module):
 
         self.to_q = nn.Sequential(
             nn.Linear(d_emb, d_emb),  # IDEA: maybe we can use LinearNoBias here.
-            Rearrange("b n l (h d) -> b l h n d", h=n_heads),
+            Rearrange("b 1 l (h d) -> b l h 1 d", h=n_heads),
         )
         self.to_k = nn.Sequential(
             nn.Linear(d_emb, d_emb),  # IDEA: maybe we can use LinearNoBias here.
-            Rearrange("b m l (h d) -> b l h m d", h=n_heads),
+            Rearrange("b N l (h d) -> b l h N d", h=n_heads),
         )
         self.dropout = nn.Dropout(p_dropout)
 
@@ -79,11 +80,105 @@ class PositionWiseWeightFactor(nn.Module):
         q = self.to_q(query_seq) * self.scale
         k = self.to_k(msa_emb)
 
-        logits = torch.einsum("b l h n d, b l h m d -> b l h n m", q, k)
+        logits = torch.einsum("b l h q d, b l h n d -> b l h q n", q, k)
         # IDEA: maybe we can use dropout here at logits to make weights sum to 1.
+
+        att = logits.softmax(dim=-1)
+        att = rearrange(att, "b l h 1 N -> b N h l 1")
+        return self.dropout(att)
+
+
+class SoftTiedAttentionOverResidues(nn.Module):
+    def __init__(self, d_emb=384, n_heads=12, p_dropout=0.1):
+        super().__init__()
+        assert (
+            d_emb % n_heads == 0
+        ), f"[{self.__class__.__name__}]: d_emb ({d_emb}) must be divisible by n_heads ({n_heads})."
+
+        self.n_heads = n_heads
+        self.d_head = d_emb // n_heads
+        self.scale = self.d_head ** (-0.5)
+
+        self.poswise_weight = PositionWiseWeightFactor(d_emb, n_heads, p_dropout)
+
+        # IDEA: maybe we can use LinearNoBias for the projections below.
+        self.to_q = nn.Linear(d_emb, d_emb)
+        self.to_k = nn.Linear(d_emb, d_emb)
+        self.to_v = nn.Linear(d_emb, d_emb)
+        self.to_out = nn.Linear(d_emb, d_emb)
+        self.dropout = nn.Dropout(p_dropout)
+
+    def forward(self, x):
+        """x : (B, N, L, d_emb)"""
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
+
+        q, k, v = map(
+            lambda t: Rearrange("b n l (h d) -> b n h l d", h=self.n_heads)(t),
+            (q, k, v),
+        )
+        # poswise_weight : (b n h l 1)
+        q = q * self.poswise_weight(x) * self.scale
+
+        logits = torch.einsum("b n h i d, b n h j d -> b n h i j", q, k)
         att = logits.softmax(dim=-1)
 
-        return self.dropout(att)
+        out = torch.einsum("b n h i j, b n h j d -> b n h i d", att, v)
+        out = rearrange(out, "b n h l d -> b n l (h d)")
+        out = self.to_out(out)
+
+        return self.dropout(out)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, d_emb, d_ff, p_dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_emb, d_ff),
+            nn.ReLU(),
+            nn.Dropout(p_dropout),
+            nn.Linear(d_ff, d_emb),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class EncoderLayer(nn.Module):
+    def __init__(
+        self,
+        d_emb=384,
+        d_ff=384 * 4,
+        n_heads=12,
+        p_dropout=0.1,
+        tied=False,
+        performer=False,
+        performer_kws=None,
+    ):
+        super().__init__()
+
+        if tied:
+            self.attn = SoftTiedAttentionOverResidues()
+        elif performer:
+            self.attn = PerformerSelfAttention(
+                dim=d_emb, heads=n_heads, **performer_kws
+            )
+        else:
+            raise NotImplementedError
+
+        self.ff = FeedForward(d_emb, d_ff, p_dropout=p_dropout)
+
+    def forward(self, x):
+        pass
+
+
+class MSAUpdateUsingSelfAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        pass
 
 
 class RoseTTAFold(pl.LightningModule):
