@@ -154,23 +154,45 @@ class EncoderLayer(nn.Module):
         p_dropout=0.1,
         tied=False,
         performer=False,
-        performer_kws=None,
+        performer_kws={},
     ):
         super().__init__()
 
+        # Define attention operation
         if tied:
-            self.attn = SoftTiedAttentionOverResidues()
+            self.attn = SoftTiedAttentionOverResidues(
+                d_emb=d_emb, n_heads=n_heads, p_dropout=p_dropout
+            )
         elif performer:
             self.attn = PerformerSelfAttention(
-                dim=d_emb, heads=n_heads, **performer_kws
+                dim=d_emb, heads=n_heads, dropout=p_dropout,
+                generalized_attention=True, **performer_kws
             )
         else:
             raise NotImplementedError
 
-        self.ff = FeedForward(d_emb, d_ff, p_dropout=p_dropout)
+        # Define layer
+        self.layer = nn.Sequential(
+            Residual(
+                nn.Sequential(
+                    Rearrange('b n l d -> (b n) l d') if not tied else nn.Identity(),
+                    nn.LayerNorm(d_emb),
+                    self.attn,
+                    nn.Dropout(p_dropout),
+                    Rearrange('(b n) l d -> b n l d', n=n_heads) if not tied else nn.Identity(),
+                ),
+            ),
+            Residual(
+                nn.Sequential(
+                    nn.LayerNorm(d_emb),
+                    FeedForward(d_emb, d_ff, p_dropout=p_dropout),
+                    nn.Dropout(p_dropout),
+                )
+            )
+        )
 
     def forward(self, x):
-        pass
+        return self.layer(x)
 
 
 class MSAUpdateUsingSelfAttention(nn.Module):
