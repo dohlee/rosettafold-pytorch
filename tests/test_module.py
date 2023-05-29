@@ -10,6 +10,7 @@ from rosettafold_pytorch.rosettafold_pytorch import (
     SoftTiedAttentionOverResidues,
     EncoderLayer,
     MSAUpdateUsingSelfAttention,
+    OuterProductMean,
 )
 
 
@@ -205,3 +206,32 @@ def test_MSAUpdateUsingSelfAttention_shape():
     )
 
     assert msa_update(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
+
+
+# OuterProductMean
+def test_OuterProductMean_init():
+    d_emb = 16
+    out_features = 32
+
+    outer_product_mean = OuterProductMean(in_features=d_emb, out_features=out_features)
+
+    assert outer_product_mean is not None
+
+
+def test_OuterProductMean_shape():
+    bsz, n_seq, max_len = 4, 10, 64
+    d_emb = 16
+    out_features = 32
+
+    msa = torch.randint(0, 21, (bsz, n_seq, max_len))
+    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_emb = msa_embedder(msa)
+
+    outer_product_mean = OuterProductMean(in_features=d_emb, out_features=out_features)
+
+    assert outer_product_mean(msa_emb, msa_emb).shape == (
+        bsz,
+        max_len,
+        max_len,
+        out_features,
+    )

@@ -191,7 +191,8 @@ class EncoderLayer(nn.Module):
         )
 
     def forward(self, x):
-        N = x.size(1)
+        N = x.size(1)  # Number of sequences
+
         if not self.tied:
             x = rearrange(x, "b n l d -> (b n) l d")
 
@@ -199,6 +200,7 @@ class EncoderLayer(nn.Module):
 
         if not self.tied:
             x = rearrange(x, "(b n) l d -> b n l d", n=N)
+
         return self.ff(x)
 
 
@@ -237,6 +239,23 @@ class MSAUpdateUsingSelfAttention(nn.Module):
 
     def forward(self, x):
         return self.layer(x)
+
+
+class OuterProductMean(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.to_out = nn.Sequential(
+            nn.LayerNorm(in_features**2), nn.Linear(in_features**2, out_features)
+        )
+
+    def forward(self, x, y=None):
+        y = x if y is None else y
+
+        x = torch.einsum("b n i u, b n j v -> b i j u v", x, y)  # Outer product mean
+        print(x.shape)
+        x = rearrange(x, "b i j u v -> b i j (u v)")
+
+        return self.to_out(x)
 
 
 class RoseTTAFold(pl.LightningModule):
