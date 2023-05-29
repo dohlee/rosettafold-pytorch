@@ -157,50 +157,88 @@ class EncoderLayer(nn.Module):
         performer_kws={},
     ):
         super().__init__()
+        self.tied = tied
 
         # Define attention operation
-        if tied:
+        if self.tied:
             self.attn = SoftTiedAttentionOverResidues(
                 d_emb=d_emb, n_heads=n_heads, p_dropout=p_dropout
             )
         elif performer:
             self.attn = PerformerSelfAttention(
-                dim=d_emb, heads=n_heads, dropout=p_dropout,
-                generalized_attention=True, **performer_kws
+                dim=d_emb,
+                heads=n_heads,
+                dropout=p_dropout,
+                **performer_kws,
             )
         else:
             raise NotImplementedError
 
         # Define layer
-        self.layer = nn.Sequential(
-            Residual(
-                nn.Sequential(
-                    Rearrange('b n l d -> (b n) l d') if not tied else nn.Identity(),
-                    nn.LayerNorm(d_emb),
-                    self.attn,
-                    nn.Dropout(p_dropout),
-                    Rearrange('(b n) l d -> b n l d', n=n_heads) if not tied else nn.Identity(),
-                ),
+        self.att = Residual(
+            nn.Sequential(
+                nn.LayerNorm(d_emb),
+                self.attn,
+                nn.Dropout(p_dropout),
             ),
-            Residual(
-                nn.Sequential(
-                    nn.LayerNorm(d_emb),
-                    FeedForward(d_emb, d_ff, p_dropout=p_dropout),
-                    nn.Dropout(p_dropout),
-                )
+        )
+        self.ff = Residual(
+            nn.Sequential(
+                nn.LayerNorm(d_emb),
+                FeedForward(d_emb, d_ff, p_dropout=p_dropout),
+                nn.Dropout(p_dropout),
             )
         )
 
     def forward(self, x):
-        return self.layer(x)
+        N = x.size(1)
+        if not self.tied:
+            x = rearrange(x, "b n l d -> (b n) l d")
+
+        x = self.att(x)
+
+        if not self.tied:
+            x = rearrange(x, "(b n) l d -> b n l d", n=N)
+        return self.ff(x)
 
 
 class MSAUpdateUsingSelfAttention(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        d_emb=384,
+        d_ff=384 * 4,
+        n_heads=12,
+        p_dropout=0.1,
+        tied=False,
+        performer=False,
+        performer_kws={},
+    ):
         super().__init__()
 
+        self.layer = nn.Sequential(
+            EncoderLayer(
+                d_emb=d_emb,
+                d_ff=d_ff,
+                n_heads=n_heads,
+                p_dropout=p_dropout,
+                tied=True,
+                performer=False,
+            ),
+            Rearrange("b n l d -> b l n d"),
+            EncoderLayer(
+                d_emb=d_emb,
+                d_ff=d_ff,
+                n_heads=n_heads,
+                p_dropout=p_dropout,
+                tied=False,
+                performer=True,
+                performer_kws=performer_kws,
+            ),
+            Rearrange("b l n d -> b n l d"),
+        )
+
     def forward(self, x):
-        pass
+        return self.layer(x)
 
 
 class RoseTTAFold(pl.LightningModule):

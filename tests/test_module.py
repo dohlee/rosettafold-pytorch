@@ -9,6 +9,7 @@ from rosettafold_pytorch.rosettafold_pytorch import (
     PositionWiseWeightFactor,
     SoftTiedAttentionOverResidues,
     EncoderLayer,
+    MSAUpdateUsingSelfAttention,
 )
 
 
@@ -124,20 +125,27 @@ def test_SoftTiedAttentionOverResidues_shape():
 
     assert att(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
 
+
 # EncoderLayer
 def test_EncoderLayer_tied_init():
     d_emb, n_heads = 64, 4
     d_ff = d_emb * 4
 
-    enc = EncoderLayer(d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, tied=True)
+    enc = EncoderLayer(
+        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, tied=True
+    )
     assert enc is not None
+
 
 def test_EncoderLayer_performer_init():
     d_emb, n_heads = 64, 4
     d_ff = d_emb * 4
 
-    enc = EncoderLayer(d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, performer=True)
+    enc = EncoderLayer(
+        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, performer=True
+    )
     assert enc is not None
+
 
 def test_EncoderLayer_tied_shape():
     bsz, n_seq, max_len = 4, 10, 64
@@ -148,19 +156,52 @@ def test_EncoderLayer_tied_shape():
     msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
-    enc = EncoderLayer(d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, tied=True)
-    
+    enc = EncoderLayer(
+        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, tied=True
+    )
+
     assert enc(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
 
-# def test_EncoderLayer_performer_shape():
-#     bsz, n_seq, max_len = 4, 10, 64
-#     d_emb, n_heads = 16, 2
-#     d_ff = d_emb * 4
 
-#     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-#     msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
-#     msa_emb = msa_embedder(msa)
+def test_EncoderLayer_performer_shape():
+    bsz, n_seq, max_len = 4, 10, 64
+    d_emb, n_heads = 16, 2
+    d_ff = d_emb * 4
 
-#     enc = EncoderLayer(d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, performer=True)
-    
-#     assert enc(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
+    msa = torch.randint(0, 21, (bsz, n_seq, max_len))
+    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_emb = msa_embedder(msa)
+
+    enc = EncoderLayer(
+        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, performer=True
+    )
+
+    assert enc(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
+
+
+# MSAUpdateUsingSelfAttention
+def test_MSAUpdateUsingSelfAttention_init():
+    d_emb, n_heads = 16, 2
+    d_ff = d_emb * 4
+
+    msa_update = MSAUpdateUsingSelfAttention(
+        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1
+    )
+
+    assert msa_update is not None
+
+
+def test_MSAUpdateUsingSelfAttention_shape():
+    bsz, n_seq, max_len = 4, 10, 64
+    d_emb, n_heads = 16, 2
+    d_ff = d_emb * 4
+
+    msa = torch.randint(0, 21, (bsz, n_seq, max_len))
+    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_emb = msa_embedder(msa)
+
+    msa_update = MSAUpdateUsingSelfAttention(
+        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1
+    )
+
+    assert msa_update(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
