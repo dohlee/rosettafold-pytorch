@@ -18,6 +18,32 @@ class Residual(nn.Module):
         return self.fn(x) + x
 
 
+class ColWise(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        b, n = x.size(0), x.size(1)
+        x = rearrange(x, "b n l d -> (b n) l d")
+        x = self.fn(x)
+        x = rearrange(x, "(b n) l d -> b n l d", b=b, n=n)
+        return x
+
+
+class RowWise(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        b, n = x.size(0), x.size(1)
+        x = rearrange(x, "b n l d -> (b l) n d")
+        x = self.fn(x)
+        x = rearrange(x, "(b l) n d -> b n l d", b=b, n=n)
+        return x
+
+
 def sinusoidal_positional_encoding(max_len, d_emb):
     # Sinusoidal positional encoding
     # PE(pos, 2i) = sin(pos / 10000^(2i/d_emb))
@@ -330,6 +356,36 @@ class PairUpdateWithMSA(nn.Module):
         )
 
         return self.resnet(feat)
+
+
+class PairUpdateWithAxialAttention(nn.Module):
+    def __init__(self, d_pair, d_ff, n_heads, p_dropout, performer_kws={}):
+        super().__init__()
+
+        self.row_attn = PerformerSelfAttention(
+            dim=d_pair,
+            heads=n_heads,
+            dropout=p_dropout,
+            generalized_attention=True,
+            **performer_kws,
+        )
+        self.col_attn = PerformerSelfAttention(
+            dim=d_pair,
+            heads=n_heads,
+            dropout=p_dropout,
+            generalized_attention=True,
+            **performer_kws,
+        )
+        self.ff = FeedForward(d_pair, d_ff, p_dropout)
+
+        self.layer = nn.Sequential(
+            Residual(nn.Sequential(nn.LayerNorm(d_pair), RowWise(self.row_attn))),
+            Residual(nn.Sequential(nn.LayerNorm(d_pair), ColWise(self.col_attn))),
+            Residual(nn.Sequential(nn.LayerNorm(d_pair), self.ff)),
+        )
+
+    def forward(self, x):
+        return self.layer(x)
 
 
 class RoseTTAFold(pl.LightningModule):

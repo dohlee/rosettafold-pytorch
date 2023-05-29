@@ -12,6 +12,7 @@ from rosettafold_pytorch.rosettafold_pytorch import (
     MSAUpdateUsingSelfAttention,
     OuterProductMean,
     PairUpdateWithMSA,
+    PairUpdateWithAxialAttention,
 )
 
 
@@ -268,3 +269,31 @@ def test_PairUpdateWithMSA_shape():
     att = torch.randn(bsz, max_len, max_len, n_heads)
 
     assert pair_update(msa_emb, pair, att).shape == (bsz, max_len, max_len, d_pair)
+
+
+# PairUpdateWithAxialAttention
+def test_PairUpdateWithAxialAttention_init():
+    d_pair, n_heads = 4, 2
+
+    pair_update = PairUpdateWithAxialAttention(
+        d_pair=d_pair,
+        d_ff=d_pair * 4,
+        n_heads=n_heads,
+        p_dropout=0.1,
+    )
+
+    assert pair_update is not None
+
+
+def test_PairUpdateWithAxialAttention_shape():
+    bsz, d_pair, n_heads, max_len = 4, 16, 4, 64
+
+    pair_update = PairUpdateWithAxialAttention(
+        d_pair=d_pair,
+        d_ff=d_pair * 4,
+        n_heads=n_heads,
+        p_dropout=0.1,
+    )
+
+    pair = torch.randn(bsz, max_len, max_len, d_pair)
+    assert pair_update(pair).shape == (bsz, max_len, max_len, d_pair)
