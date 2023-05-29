@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
-from einops import rearrange
+from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from performer_pytorch import SelfAttention as PerformerSelfAttention
 
@@ -252,10 +252,84 @@ class OuterProductMean(nn.Module):
         y = x if y is None else y
 
         x = torch.einsum("b n i u, b n j v -> b i j u v", x, y)  # Outer product mean
-        print(x.shape)
         x = rearrange(x, "b i j u v -> b i j (u v)")
 
         return self.to_out(x)
+
+
+class PairUpdateWithMSA(nn.Module):
+    def __init__(self, d_emb, d_proj, d_pair, n_heads, p_dropout=0.1):
+        super().__init__()
+
+        self.proj_msa = nn.Sequential(
+            nn.LayerNorm(d_emb),
+            nn.Linear(d_emb, d_proj),
+            nn.LayerNorm(d_proj),
+        )
+        self.poswise_weight = PositionWiseWeightFactor(d_proj, 1, p_dropout)
+
+        self.outer_product_mean = OuterProductMean(d_proj, d_pair)
+        self.ln_coevol_feat = nn.LayerNorm(d_pair)
+        self.ln_pair = nn.LayerNorm(d_pair)
+
+        d_feat_full = d_pair * 2 + d_proj * 4 + n_heads
+        self.resnet = nn.Sequential(
+            nn.Linear(d_feat_full, d_pair),
+            Residual(
+                nn.Sequential(
+                    Rearrange("b l1 l2 d -> b d l1 l2"),
+                    nn.Conv2d(
+                        d_pair, d_pair, kernel_size=3, padding="same", bias=False
+                    ),
+                    nn.InstanceNorm2d(d_pair, affine=True, eps=1e-6),
+                    nn.ELU(),
+                    nn.Dropout(p_dropout),
+                    nn.Conv2d(
+                        d_pair, d_pair, kernel_size=3, padding="same", bias=False
+                    ),
+                    nn.InstanceNorm2d(d_pair, affine=True, eps=1e-6),
+                    Rearrange("b d l1 l2 -> b l1 l2 d"),
+                )
+            ),
+            # (b l1 l2 d_pair)
+            nn.ELU(),
+        )
+
+    def forward(self, msa, pair, att):
+        L = msa.size(2)  # Length of sequences in MSA
+        msa_proj = self.proj_msa(msa)  # (b N l d)
+
+        w = self.poswise_weight(msa_proj)
+        w = rearrange(w, "b n 1 l 1 -> b n l 1")  # (b N l 1)
+
+        msa_proj_weighted = msa_proj * w
+
+        coevol_feat = self.outer_product_mean(msa_proj, msa_proj_weighted)
+        coevol_feat = self.ln_coevol_feat(coevol_feat)
+
+        msa_1d = torch.cat(
+            [
+                reduce(msa_proj, "b n l d -> b l d", "sum"),  # IDEA: mean-reduction?
+                msa_proj[:, 0],  # MSA embeddings for query sequence
+            ],
+            dim=-1,
+        )
+
+        msa_rowwise_tiled_feat = repeat(msa_1d, "b l1 d -> b l1 l2 d", l2=L)
+        msa_colwise_tiled_feat = repeat(msa_1d, "b l1 d -> b l2 l1 d", l2=L)
+
+        feat = torch.cat(
+            [
+                coevol_feat,  # (b l l d_pair)
+                msa_rowwise_tiled_feat,  # (b l l d_proj * 2)
+                msa_colwise_tiled_feat,  # (b l l d_proj * 2)
+                self.ln_pair(pair),  # (b l l d_pair)
+                att,  # (b l l n_heads)
+            ],
+            dim=-1,
+        )
+
+        return self.resnet(feat)
 
 
 class RoseTTAFold(pl.LightningModule):

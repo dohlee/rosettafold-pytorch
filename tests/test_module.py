@@ -11,6 +11,7 @@ from rosettafold_pytorch.rosettafold_pytorch import (
     EncoderLayer,
     MSAUpdateUsingSelfAttention,
     OuterProductMean,
+    PairUpdateWithMSA,
 )
 
 
@@ -235,3 +236,35 @@ def test_OuterProductMean_shape():
         max_len,
         out_features,
     )
+
+
+# PairUpdateWithMSA
+def test_PairUpdateWithMSA_init():
+    d_emb, d_proj, d_pair, n_heads = 16, 4, 4, 2
+
+    pair_update = PairUpdateWithMSA(
+        d_emb=d_emb, d_proj=d_proj, d_pair=d_pair, n_heads=n_heads, p_dropout=0.1
+    )
+
+    assert pair_update is not None
+
+
+def test_PairUpdateWithMSA_shape():
+    bsz, n_seq, max_len = 4, 10, 64
+    n_heads = 2
+    d_emb = 64
+
+    msa = torch.randint(0, 21, (bsz, n_seq, max_len))
+    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_emb = msa_embedder(msa)
+
+    d_proj, d_pair = 16, 32
+
+    pair_update = PairUpdateWithMSA(
+        d_emb=d_emb, d_proj=d_proj, d_pair=d_pair, n_heads=n_heads, p_dropout=0.1
+    )
+
+    pair = torch.randn(bsz, max_len, max_len, d_pair)
+    att = torch.randn(bsz, max_len, max_len, n_heads)
+
+    assert pair_update(msa_emb, pair, att).shape == (bsz, max_len, max_len, d_pair)
