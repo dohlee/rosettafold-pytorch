@@ -209,8 +209,6 @@ class MSAUpdateUsingSelfAttention(nn.Module):
         d_ff=384 * 4,
         n_heads=12,
         p_dropout=0.1,
-        tied=False,
-        performer=False,
         performer_kws={},
     ):
         super().__init__()
