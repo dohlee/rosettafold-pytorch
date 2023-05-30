@@ -1,4 +1,4 @@
-# rosettafold-pytorch
+# rosettafold-pytorch (wip)
 
 [![Lightning](https://img.shields.io/badge/-Lightning-792ee5?logo=pytorchlightning&logoColor=white)](https://github.com/Lightning-AI/lightning)
 
