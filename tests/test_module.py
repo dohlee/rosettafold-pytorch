@@ -52,9 +52,7 @@ def test_PositionWiseWeightFactor_init_errors_when_d_emb_is_not_divisible_by_n_h
     d_emb, n_heads = 64, 3
 
     with pytest.raises(AssertionError):
-        pos_wise_weight_factor = PositionWiseWeightFactor(
-            d_emb=d_emb, n_heads=n_heads, p_dropout=0.1
-        )
+        PositionWiseWeightFactor(d_emb=d_emb, n_heads=n_heads, p_dropout=0.1)
 
 
 def test_PositionWiseWeightFactor_shape():

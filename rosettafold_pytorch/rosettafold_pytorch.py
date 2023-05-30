@@ -388,6 +388,35 @@ class PairUpdateWithAxialAttention(nn.Module):
         return self.layer(x)
 
 
+class Symmetrization(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        xt = rearrange(x, "b i j d -> b j i d")
+        return 0.5 * (x + xt)
+
+
+class MSAUpdateWithPair(nn.Module):
+    def __init__(self, d_emb, d_pair, n_heads, p_dropout=0.1):
+        super().__init__()
+
+        self.pair2att = nn.Sequential(
+            Symmetrization(),
+            nn.LayerNorm(d_pair),
+            nn.Linear(d_pair, n_heads),
+            nn.Softmax(dim=1),
+        )
+
+        self.msa2value = nn.Sequential(
+            nn.LayerNorm(d_emb),
+            nn.Linear(d_emb, d_emb),
+        )
+
+    def forward(self, x):
+        pass
+
+
 class RoseTTAFold(pl.LightningModule):
     def __init__(
         self,

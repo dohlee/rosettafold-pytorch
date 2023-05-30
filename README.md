@@ -1,6 +1,6 @@
 # rosettafold-pytorch
 
-[![Lightning](https://img.shields.io/badge/Lightning-792EE5?style=flat&logo=PyTorch%20Lightning&logoColor=white)](https://www.pytorchlightning.ai/)
+[![Lightning](https://img.shields.io/badge/-Lightning-792ee5?logo=pytorchlightning&logoColor=white)](https://github.com/Lightning-AI/lightning)
 
 ![img](img/rosettafold_banner.png)
 
