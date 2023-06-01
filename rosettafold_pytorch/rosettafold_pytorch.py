@@ -10,12 +10,16 @@ from performer_pytorch import SelfAttention as PerformerSelfAttention
 
 
 class Residual(nn.Module):
-    def __init__(self, fn):
+    def __init__(self, fn, p_dropout=None):
         super().__init__()
         self.fn = fn
+        self.dropout = nn.Dropout(p_dropout) if p_dropout is not None else None
 
     def forward(self, x):
-        return self.fn(x) + x
+        if self.dropout is not None:
+            return self.dropout(self.fn(x)) + x
+        else:
+            return self.fn(x) + x
 
 
 class ColWise(nn.Module):
@@ -405,16 +409,36 @@ class MSAUpdateWithPair(nn.Module):
             Symmetrization(),
             nn.LayerNorm(d_pair),
             nn.Linear(d_pair, n_heads),
-            nn.Softmax(dim=1),
+            nn.Dropout(p_dropout),
+            Rearrange("b i j h -> b () h i j"),
+            nn.Softmax(dim=-1),
         )
 
         self.msa2value = nn.Sequential(
             nn.LayerNorm(d_emb),
             nn.Linear(d_emb, d_emb),
+            Rearrange("b n j (h d) -> b n h j d", h=n_heads),
         )
 
-    def forward(self, x):
-        pass
+        self.ff = Residual(
+            nn.Sequential(
+                nn.LayerNorm(d_emb),
+                FeedForward(d_emb, d_emb, p_dropout),
+            ),
+            p_dropout=p_dropout,
+        )
+
+        self.dropout1 = nn.Dropout(p_dropout)
+
+    def forward(self, msa, pair):
+        value = self.msa2value(msa)
+        att = self.pair2att(pair)
+
+        updated = self.dropout(
+            torch.einsum("b ... h i j, b n h j d -> b n h i d", att, value)
+        )
+
+        return self.ff(msa + updated)
 
 
 class RoseTTAFold(pl.LightningModule):
