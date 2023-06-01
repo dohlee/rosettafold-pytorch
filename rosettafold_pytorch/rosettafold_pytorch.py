@@ -441,6 +441,80 @@ class MSAUpdateWithPair(nn.Module):
         return self.ff(msa + updated)
 
 
+class GraphTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, node_feat, edge_feat, edge_idx):
+        pass
+
+
+class CoordGenerationWithMSAAndPair(nn.Module):
+    def __init__(self, d_emb, d_pair, d_node=64, d_edge=64, p_dropout=0.1):
+        super().__init__()
+
+        self.ln_msa = nn.LayerNorm(d_emb)
+        self.ln_pair = nn.LayerNorm(d_pair)
+
+        self.poswise_weight = PositionWiseWeightFactor(d_emb, 1, p_dropout)
+
+        self.node_embed = nn.Sequential(
+            nn.Linear(d_emb + 21, d_node),
+            nn.ELU(),
+        )
+
+        self.edge_embed = nn.Sequential(
+            nn.Linear(d_pair + 1, d_edge),
+            nn.ELU(),
+        )
+
+        self.blocks = [nn.Sequential(GraphTransformer(), nn.LayerNorm())]
+
+        self.to_out = nn.Linear(d_node, 9)
+
+    def _sequence_separation_matrix(self, aa_pos):
+        """Featurize the distance between amino acid sequence.
+        Given two amino acid positions, i and j, the sequence separation feature
+        is defined as sign(j - i) * log(|j - i| + 1)
+
+        Args:
+            aa_pos, (b l): the position of amino acids in the sequence.
+
+        Returns:
+            (b l l 1): sequence separation feature.
+        """
+        dist = aa_pos.unsqueeze(-1) - aa_pos.unsqueeze(-2)
+        dist = torch.sign(dist) * torch.log(torch.abs(dist) + 1)
+
+        return dist.clamp(0.0, 5.5).unsqueeze(-1)
+
+    def forward(self, msa, pair, seq_onehot, aa_pos):
+        """
+        Args:
+            msa, (b n l d): MSA features.
+            pair, (b l l d): Pairwise features.
+            seq_onehot, (b l 21): One-hot encoding of the query sequence.
+            aa_pos, (b l): the position of amino acids in the sequence.
+        """
+
+        msa = self.ln_msa(msa)  # (b N l d)
+        pair = self.ln_pair(pair)  # (b l l d)
+
+        # Compute the position-wise weight factor.
+        w = self.poswise_weight(msa)
+        w = rearrange(w, "b n 1 l 1 -> b n l 1")  # (b N l 1)
+
+        # Compute the node feature.
+        node = torch.cat([(msa * w).sum(dim=1), seq_onehot], dim=-1)
+        node = self.node_embed(node)
+
+        # Attach sequence separation feature to pair feature.
+        edge = torch.cat([pair, self._sequence_separation_matrix(aa_pos)], dim=-1)
+        edge = self.edge_embed(edge)
+
+        return rearrange(self.to_out(node), "b l 9 -> b l 3 3")
+
+
 class RoseTTAFold(pl.LightningModule):
     def __init__(
         self,
