@@ -1,19 +1,23 @@
+import warnings
+
 import pytest
 import torch
-import warnings
+import torch.nn.functional as F
 
 warnings.filterwarnings("ignore")
 
 from rosettafold_pytorch.rosettafold_pytorch import (
+    EncoderLayer,
     MSAEmbedding,
+    MSAUpdateUsingSelfAttention,
+    MSAUpdateWithPair,
+    OuterProductMean,
+    PairUpdateWithAxialAttention,
+    PairUpdateWithMSA,
     PositionWiseWeightFactor,
     SoftTiedAttentionOverResidues,
-    EncoderLayer,
-    MSAUpdateUsingSelfAttention,
-    OuterProductMean,
-    PairUpdateWithMSA,
-    PairUpdateWithAxialAttention,
-    MSAUpdateWithPair,
+    GraphTransformer,
+    InitialCoordGenerationWithMSAAndPair,
 )
 
 
@@ -100,7 +104,6 @@ def test_SoftTiedAttentionOverResidues_init():
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
     msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
-    msa_emb = msa_embedder(msa)
 
     att = SoftTiedAttentionOverResidues(
         d_emb=d_emb,
@@ -307,3 +310,103 @@ def test_MSAUpdateWithPair_init():
     )
 
     assert msa_update is not None
+
+
+# GraphTransformer
+def test_GraphTransformer_init():
+    d_node_in = 16
+    d_node_out = 16
+    d_edge = 16
+    n_heads = 4
+
+    graph_transformer = GraphTransformer(
+        d_node_in=d_node_in,
+        d_node_out=d_node_out,
+        d_edge=d_edge,
+        n_heads=n_heads,
+        p_dropout=0.15,
+    )
+
+    assert graph_transformer is not None
+
+
+def test_GraphTransformer_shape():
+    d_node_in = 16
+    d_node_out = 16
+    d_edge = 16
+    n_heads = 4
+
+    graph_transformer = GraphTransformer(
+        d_node_in=d_node_in,
+        d_node_out=d_node_out,
+        d_edge=d_edge,
+        n_heads=n_heads,
+        p_dropout=0.15,
+    )
+
+    """node_feat, (b l d_node_in)
+        edge_feat, (b l l d_edge)
+        edge_mask, (b l l): True (1) if eij exists, else False (0)
+        """
+    bsz, l, d_node = 4, 32, 16
+    d_edge = 16
+
+    node_feat = torch.randn(bsz, l, d_node)
+    edge_feat = torch.randn(bsz, l, l, d_edge)
+    edge_mask = torch.randint(0, 2, (bsz, l, l)).float()
+
+    assert graph_transformer(node_feat, edge_feat, edge_mask).shape == (
+        bsz,
+        l,
+        d_node_out * n_heads,
+    )
+
+
+# InitialCoordGenerationWithMSAAndPair
+def test_InitialCoordGenerationWithMSAAndPair_init():
+    d_emb = 16
+    d_pair = 16
+    n_heads = 4
+    n_layers = 2
+
+    initial_coord_generation = InitialCoordGenerationWithMSAAndPair(
+        d_emb=d_emb,
+        d_pair=d_pair,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        p_dropout=0.1,
+    )
+
+    assert initial_coord_generation is not None
+
+
+def test_InitialCoordGenerationWithMSAAndPair_shape():
+    d_emb = 16
+    d_pair = 16
+    n_heads = 4
+    n_layers = 2
+
+    initial_coord_generation = InitialCoordGenerationWithMSAAndPair(
+        d_emb=d_emb,
+        d_pair=d_pair,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        p_dropout=0.1,
+    )
+
+    bsz, n_seq, max_len = 4, 10, 64
+    msa = torch.randint(0, 21, (bsz, n_seq, max_len))
+    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_emb = msa_embedder(msa)
+
+    pair_emb = torch.randn(bsz, max_len, max_len, d_pair)
+    seq_onehot = F.one_hot(torch.randint(0, 21, (bsz, max_len)), num_classes=21).float()
+
+    aa_pos = torch.randint(0, max_len, (bsz, max_len))
+
+    assert initial_coord_generation(msa_emb, pair_emb, seq_onehot, aa_pos).shape == (
+        bsz,
+        max_len,
+        3,
+        3,
+    )

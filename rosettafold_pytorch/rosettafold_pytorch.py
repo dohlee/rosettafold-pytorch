@@ -1,9 +1,9 @@
 import math
+
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
-
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from performer_pytorch import SelfAttention as PerformerSelfAttention
@@ -442,15 +442,79 @@ class MSAUpdateWithPair(nn.Module):
 
 
 class GraphTransformer(nn.Module):
-    def __init__(self):
+    def __init__(self, d_node_in, d_node_out, d_edge, n_heads, p_dropout=0.15):
+        super().__init__()
+        self.scale = d_node_out ** (-0.5)
+
+        # These linear weights should be initialized with
+        # kaiming_uniform(weight, fan=in_channels, a=math.sqrt(5))
+        self.node_update = nn.Linear(d_node_in, d_node_out * n_heads, bias=True)
+
+        self.node_to_q = nn.Linear(d_node_in, d_node_out * n_heads, bias=True)
+        self.node_to_k = nn.Linear(d_node_in, d_node_out * n_heads, bias=True)
+        self.node_to_v = nn.Linear(d_node_in, d_node_out * n_heads, bias=True)
+
+        self.edge_emb = nn.Linear(d_edge, d_node_out * n_heads, bias=False)
+
+        self.att_dropout = nn.Dropout(p_dropout)
+
+        self.n_heads = n_heads
+
+    def forward(self, node_feat, edge_feat, edge_mask):
+        """node_feat, (b l d_node_in)
+        edge_feat, (b l l d_edge)
+        edge_mask, (b l l): True (1) if eij exists, else False (0)
+        """
+        q = self.node_to_q(node_feat)
+        k = self.node_to_k(node_feat)
+        v = self.node_to_v(node_feat)
+        q, k, v = map(
+            lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.n_heads), (q, k, v)
+        )
+
+        e = self.edge_emb(edge_feat)
+        e = rearrange(e, "b i j (h d) -> b h i j d", h=self.n_heads)
+
+        logit = torch.einsum("b h i d, b h j d -> b h i j", q, k)
+        logit += torch.einsum("b h i d, b h i j d -> b h i j", q, e)
+
+        att = logit * self.scale
+
+        if edge_mask is not None:
+            edge_mask = (1.0 - edge_mask) * (-1e9)
+            edge_mask = rearrange(edge_mask, "b i j -> b () i j")
+            att += edge_mask
+
+        att = att.softmax(dim=-1)  # b h i j
+        att = self.att_dropout(att)
+
+        updated = torch.einsum("b h i j, b h j d -> b h i d", att, v)
+        updated += torch.einsum("b h i j, b h i j d -> b h i d", att, e)
+        updated = rearrange(updated, "b h i d -> b i (h d)")
+
+        return self.node_update(node_feat) + updated
+
+
+class GraphTransformerBlock(nn.Module):
+    def __init__(self, d_node_in, d_node_out, d_edge, n_heads, p_dropout=0.15):
         super().__init__()
 
-    def forward(self, node_feat, edge_feat, edge_idx):
-        pass
+        self.attn = GraphTransformer(d_node_in, d_node_out, d_edge, n_heads, p_dropout)
+        self.ln = nn.LayerNorm(d_node_out * n_heads)
+        self.to_out = nn.Sequential(
+            nn.Linear(d_node_out * n_heads, d_node_in), nn.ELU()
+        )
+
+    def forward(self, node_feat, edge_feat, edge_mask):
+        return (
+            self.to_out(self.ln(self.attn(node_feat, edge_feat, edge_mask))) + node_feat
+        )
 
 
-class CoordGenerationWithMSAAndPair(nn.Module):
-    def __init__(self, d_emb, d_pair, d_node=64, d_edge=64, p_dropout=0.1):
+class InitialCoordGenerationWithMSAAndPair(nn.Module):
+    def __init__(
+        self, d_emb, d_pair, d_node=64, d_edge=64, n_heads=4, n_layers=4, p_dropout=0.1
+    ):
         super().__init__()
 
         self.ln_msa = nn.LayerNorm(d_emb)
@@ -468,7 +532,10 @@ class CoordGenerationWithMSAAndPair(nn.Module):
             nn.ELU(),
         )
 
-        self.blocks = [nn.Sequential(GraphTransformer(), nn.LayerNorm())]
+        self.blocks = [
+            GraphTransformerBlock(d_node, d_node, d_edge, n_heads, p_dropout)
+            for _ in range(n_layers)
+        ]
 
         self.to_out = nn.Linear(d_node, 9)
 
@@ -483,7 +550,7 @@ class CoordGenerationWithMSAAndPair(nn.Module):
         Returns:
             (b l l 1): sequence separation feature.
         """
-        dist = aa_pos.unsqueeze(-1) - aa_pos.unsqueeze(-2)
+        dist = aa_pos.unsqueeze(-1) - aa_pos.unsqueeze(-2)  # All-pairwise diff
         dist = torch.sign(dist) * torch.log(torch.abs(dist) + 1)
 
         return dist.clamp(0.0, 5.5).unsqueeze(-1)
@@ -512,7 +579,10 @@ class CoordGenerationWithMSAAndPair(nn.Module):
         edge = torch.cat([pair, self._sequence_separation_matrix(aa_pos)], dim=-1)
         edge = self.edge_embed(edge)
 
-        return rearrange(self.to_out(node), "b l 9 -> b l 3 3")
+        for block in self.blocks:
+            node = block(node, edge, edge_mask=None)  # Fully connected graph
+
+        return rearrange(self.to_out(node), "b l (a xyz) -> b l a xyz", a=3, xyz=3)
 
 
 class RoseTTAFold(pl.LightningModule):
