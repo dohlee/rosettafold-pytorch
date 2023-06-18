@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from performer_pytorch import SelfAttention as PerformerSelfAttention
+from se3_transformer_pytorch import SE3Transformer
 
 
 class Residual(nn.Module):
@@ -61,7 +62,7 @@ def sinusoidal_positional_encoding(max_len, d_emb):
     return pos_enc
 
 
-class MSAEmbedding(nn.Module):
+class MsaEmbedding(nn.Module):
     def __init__(self, d_input=21, d_emb=64, max_len=5000, p_pe_drop=0.1):
         super().__init__()
         self.to_embedding = nn.Embedding(d_input, d_emb)
@@ -234,7 +235,7 @@ class EncoderLayer(nn.Module):
         return self.ff(x)
 
 
-class MSAUpdateUsingSelfAttention(nn.Module):
+class MsaUpdateUsingSelfAttention(nn.Module):
     def __init__(
         self,
         d_emb=384,
@@ -281,13 +282,16 @@ class OuterProductMean(nn.Module):
     def forward(self, x, y=None):
         y = x if y is None else y
 
-        x = torch.einsum("b n i u, b n j v -> b i j u v", x, y)  # Outer product mean
+        n = x.size(1)
+        x = (
+            torch.einsum("b n i u, b n j v -> b i j u v", x, y) / n
+        )  # Outer product mean
         x = rearrange(x, "b i j u v -> b i j (u v)")
 
         return self.to_out(x)
 
 
-class PairUpdateWithMSA(nn.Module):
+class PairUpdateWithMsa(nn.Module):
     def __init__(self, d_emb, d_proj, d_pair, n_heads, p_dropout=0.1):
         super().__init__()
 
@@ -511,7 +515,7 @@ class GraphTransformerBlock(nn.Module):
         )
 
 
-class InitialCoordGenerationWithMSAAndPair(nn.Module):
+class InitialCoordGenerationWithMsaAndPair(nn.Module):
     def __init__(
         self, d_emb, d_pair, d_node=64, d_edge=64, n_heads=4, n_layers=4, p_dropout=0.1
     ):
@@ -519,7 +523,6 @@ class InitialCoordGenerationWithMSAAndPair(nn.Module):
 
         self.ln_msa = nn.LayerNorm(d_emb)
         self.ln_pair = nn.LayerNorm(d_pair)
-
         self.poswise_weight = PositionWiseWeightFactor(d_emb, 1, p_dropout)
 
         self.node_embed = nn.Sequential(
@@ -585,6 +588,48 @@ class InitialCoordGenerationWithMSAAndPair(nn.Module):
         return rearrange(self.to_out(node), "b l (a xyz) -> b l a xyz", a=3, xyz=3)
 
 
+class CoordUpdateWithMsaAndPair(nn.Module):
+    def __init__(self, d_emb, d_pair, d_node, d_edge, p_dropout=0.1):
+        super().__init__()
+
+        self.ln_msa = nn.LayerNorm(d_emb)
+        self.ln_pair = nn.LayerNorm(d_pair)
+        self.poswise_weight = PositionWiseWeightFactor(d_emb, 1, p_dropout)
+
+        self.node_embed = nn.Sequential(
+            nn.Linear(d_emb + 21, d_node),
+            nn.ELU(),
+        )
+
+        self.edge_embed = nn.Sequential(
+            nn.Linear(d_pair + 1, d_edge),
+            nn.ELU(),
+        )
+        # SE(3) equivariant GCN with attention
+        # def __init__(self, num_layers=2, num_channels=32, num_degrees=3, n_heads=4, div=4,
+        #              si_m='1x1', si_e='att',
+        #              l0_in_features=32, l0_out_features=32,
+        #              l1_in_features=3, l1_out_features=3,
+        #              num_edge_features=32, x_ij=None):
+
+        self.se3_transformer = SE3Transformer()
+
+    def forward(self, xyz, msa, pair, seq_onehot):
+        msa = self.ln_msa(msa)  # (b N l d)
+        pair = self.ln_pair(pair)  # (b l l d)
+
+        # Compute the position-wise weight factor.
+        w = self.poswise_weight(msa)
+        w = rearrange(w, "b n 1 l 1 -> b n l 1")  # (b N l 1)
+
+        # Compute the node feature.
+        node = torch.cat([(msa * w).sum(dim=1), seq_onehot], dim=-1)
+        node = self.node_embed(node)
+
+        # Attach sequence separation feature to pair feature.
+        edge = self.edge_embed(pair)
+
+
 class RoseTTAFold(pl.LightningModule):
     def __init__(
         self,
@@ -595,7 +640,7 @@ class RoseTTAFold(pl.LightningModule):
     ):
         super().__init__()
 
-        self.msa_emb = MSAEmbedding(
+        self.msa_emb = MsaEmbedding(
             d_input=d_input, d_emb=d_emb, max_len=max_len, p_pe_drop=p_pe_drop
         )
 
@@ -616,6 +661,6 @@ class RoseTTAFold(pl.LightningModule):
 
 if __name__ == "__main__":
     msa = torch.randint(0, 21, (1, 10, 5000))
-    msa_emb = MSAEmbedding()
+    msa_emb = MsaEmbedding()
 
     print(msa_emb(msa).shape)

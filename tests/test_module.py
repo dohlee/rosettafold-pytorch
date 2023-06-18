@@ -8,37 +8,37 @@ warnings.filterwarnings("ignore")
 
 from rosettafold_pytorch.rosettafold_pytorch import (
     EncoderLayer,
-    MSAEmbedding,
-    MSAUpdateUsingSelfAttention,
+    MsaEmbedding,
+    MsaUpdateUsingSelfAttention,
     MSAUpdateWithPair,
     OuterProductMean,
     PairUpdateWithAxialAttention,
-    PairUpdateWithMSA,
+    PairUpdateWithMsa,
     PositionWiseWeightFactor,
     SoftTiedAttentionOverResidues,
     GraphTransformer,
-    InitialCoordGenerationWithMSAAndPair,
+    InitialCoordGenerationWithMsaAndPair,
 )
 
 
 # MSAEmbedding
-def test_MSAEmbedding_init():
-    msa_emb = MSAEmbedding(d_input=21, d_emb=64, max_len=5000, p_pe_drop=0.1)
+def test_MsaEmbedding_init():
+    msa_emb = MsaEmbedding(d_input=21, d_emb=64, max_len=5000, p_pe_drop=0.1)
     assert msa_emb is not None
 
 
-def test_MSAEmbedding_positional_encoding_is_sinusoidal():
-    msa_emb = MSAEmbedding()
+def test_MsaEmbedding_positional_encoding_is_sinusoidal():
+    msa_emb = MsaEmbedding()
 
     s = msa_emb.pos_enc[:, 0::2].square() + msa_emb.pos_enc[:, 1::2].square()
     assert torch.isclose(s, torch.tensor([1.0])).all()
 
 
-def test_MSAEmbedding_shape():
+def test_MsaEmbedding_shape():
     bsz, n_seq, max_len = 4, 10, 5000
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_emb = MSAEmbedding(d_input=21, d_emb=64, max_len=5000, p_pe_drop=0.1)
+    msa_emb = MsaEmbedding(d_input=21, d_emb=64, max_len=5000, p_pe_drop=0.1)
 
     assert msa_emb(msa).shape == (bsz, n_seq, max_len, 64)
 
@@ -65,7 +65,7 @@ def test_PositionWiseWeightFactor_shape():
     d_emb, n_heads, max_len = 64, 4, 32
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
     pos_wise_weight_factor = PositionWiseWeightFactor(
@@ -80,7 +80,7 @@ def test_PositionWiseWeightFactor_sums_to_1():
     d_emb, n_heads, max_len = 64, 4, 32
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
     pos_wise_weight_factor = PositionWiseWeightFactor(
@@ -103,7 +103,7 @@ def test_SoftTiedAttentionOverResidues_init():
     d_emb, n_heads, max_len = 64, 4, 32
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
 
     att = SoftTiedAttentionOverResidues(
         d_emb=d_emb,
@@ -119,7 +119,7 @@ def test_SoftTiedAttentionOverResidues_shape():
     d_emb, n_heads, max_len = 64, 4, 32
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
     att = SoftTiedAttentionOverResidues(
@@ -158,7 +158,7 @@ def test_EncoderLayer_tied_shape():
     d_ff = d_emb * 4
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
     enc = EncoderLayer(
@@ -174,7 +174,7 @@ def test_EncoderLayer_performer_shape():
     d_ff = d_emb * 4
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
     enc = EncoderLayer(
@@ -184,28 +184,28 @@ def test_EncoderLayer_performer_shape():
     assert enc(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
 
 
-# MSAUpdateUsingSelfAttention
-def test_MSAUpdateUsingSelfAttention_init():
+# MsaUpdateUsingSelfAttention
+def test_MsaUpdateUsingSelfAttention_init():
     d_emb, n_heads = 16, 2
     d_ff = d_emb * 4
 
-    msa_update = MSAUpdateUsingSelfAttention(
+    msa_update = MsaUpdateUsingSelfAttention(
         d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1
     )
 
     assert msa_update is not None
 
 
-def test_MSAUpdateUsingSelfAttention_shape():
+def test_MsaUpdateUsingSelfAttention_shape():
     bsz, n_seq, max_len = 4, 10, 64
     d_emb, n_heads = 16, 2
     d_ff = d_emb * 4
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
-    msa_update = MSAUpdateUsingSelfAttention(
+    msa_update = MsaUpdateUsingSelfAttention(
         d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1
     )
 
@@ -228,7 +228,7 @@ def test_OuterProductMean_shape():
     out_features = 32
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
     outer_product_mean = OuterProductMean(in_features=d_emb, out_features=out_features)
@@ -242,28 +242,28 @@ def test_OuterProductMean_shape():
 
 
 # PairUpdateWithMSA
-def test_PairUpdateWithMSA_init():
+def test_PairUpdateWithMsa_init():
     d_emb, d_proj, d_pair, n_heads = 16, 4, 4, 2
 
-    pair_update = PairUpdateWithMSA(
+    pair_update = PairUpdateWithMsa(
         d_emb=d_emb, d_proj=d_proj, d_pair=d_pair, n_heads=n_heads, p_dropout=0.1
     )
 
     assert pair_update is not None
 
 
-def test_PairUpdateWithMSA_shape():
+def test_PairUpdateWithMsa_shape():
     bsz, n_seq, max_len = 4, 10, 64
     n_heads = 2
     d_emb = 64
 
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
     d_proj, d_pair = 16, 32
 
-    pair_update = PairUpdateWithMSA(
+    pair_update = PairUpdateWithMsa(
         d_emb=d_emb, d_proj=d_proj, d_pair=d_pair, n_heads=n_heads, p_dropout=0.1
     )
 
@@ -362,14 +362,14 @@ def test_GraphTransformer_shape():
     )
 
 
-# InitialCoordGenerationWithMSAAndPair
-def test_InitialCoordGenerationWithMSAAndPair_init():
+# InitialCoordGenerationWithMsaAndPair
+def test_InitialCoordGenerationWithMsaAndPair_init():
     d_emb = 16
     d_pair = 16
     n_heads = 4
     n_layers = 2
 
-    initial_coord_generation = InitialCoordGenerationWithMSAAndPair(
+    initial_coord_generation = InitialCoordGenerationWithMsaAndPair(
         d_emb=d_emb,
         d_pair=d_pair,
         n_heads=n_heads,
@@ -380,13 +380,13 @@ def test_InitialCoordGenerationWithMSAAndPair_init():
     assert initial_coord_generation is not None
 
 
-def test_InitialCoordGenerationWithMSAAndPair_shape():
+def test_InitialCoordGenerationWithMsaAndPair_shape():
     d_emb = 16
     d_pair = 16
     n_heads = 4
     n_layers = 2
 
-    initial_coord_generation = InitialCoordGenerationWithMSAAndPair(
+    initial_coord_generation = InitialCoordGenerationWithMsaAndPair(
         d_emb=d_emb,
         d_pair=d_pair,
         n_heads=n_heads,
@@ -396,7 +396,7 @@ def test_InitialCoordGenerationWithMSAAndPair_shape():
 
     bsz, n_seq, max_len = 4, 10, 64
     msa = torch.randint(0, 21, (bsz, n_seq, max_len))
-    msa_embedder = MSAEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
     pair_emb = torch.randn(bsz, max_len, max_len, d_pair)
