@@ -589,7 +589,9 @@ class InitialCoordGenerationWithMsaAndPair(nn.Module):
 
 
 class CoordUpdateWithMsaAndPair(nn.Module):
-    def __init__(self, d_emb, d_pair, d_node, d_edge, p_dropout=0.1):
+    def __init__(
+        self, d_emb, d_pair, d_node, d_edge, d_state, n_neighbors, p_dropout=0.1
+    ):
         super().__init__()
 
         self.ln_msa = nn.LayerNorm(d_emb)
@@ -612,7 +614,14 @@ class CoordUpdateWithMsaAndPair(nn.Module):
         #              l1_in_features=3, l1_out_features=3,
         #              num_edge_features=32, x_ij=None):
 
-        self.se3_transformer = SE3Transformer()
+        self.se3_transformer = SE3Transformer(
+            n_layers=2,
+            n_heads=4,
+            l0_in_features=d_node,
+            l0_out_features=d_state,
+            edge_dim=d_edge,
+            num_neighbors=n_neighbors,
+        )
 
     def forward(self, xyz, msa, pair, seq_onehot):
         msa = self.ln_msa(msa)  # (b N l d)
@@ -624,10 +633,67 @@ class CoordUpdateWithMsaAndPair(nn.Module):
 
         # Compute the node feature.
         node = torch.cat([(msa * w).sum(dim=1), seq_onehot], dim=-1)
-        node = self.node_embed(node)
+        node = self.node_embed(node)  # (b N d_node)
 
         # Attach sequence separation feature to pair feature.
-        edge = self.edge_embed(pair)
+        edge = self.edge_embed(pair)  # (b N d_edge)
+
+        # TODO: define mask
+        mask = None
+
+        out = self.se3_transformer(node, xyz, mask, edge)
+        return out["0"], out["1"]
+
+
+class MsaUpdateWithPairAndCoord(nn.Module):
+    def __init__(
+        self, d_emb, d_state, d_ff, distance_bins=[8, 12, 16, 20], p_dropout=0.1
+    ):
+        super().__init__()
+
+        self.distance_bins = distance_bins
+        self.n_heads = len(self.distance_bins)
+
+        self.scale = (d_state // self.n_heads) ** -0.5
+
+        self.ln_msa = nn.LayerNorm(d_emb)
+        self.ln_state = nn.LayerNorm(d_state)
+
+        self.to_out = nn.Sequential(
+            nn.Residual(nn.LayerNorm(d_emb), FeedForward(d_emb, d_ff, p_dropout))
+        )
+
+    def forward(self, xyz, state, msa):
+        q = k = self.ln_state(state)
+        v = self.ln_msa(msa)
+
+        CA_IDX = 1
+        pdist = torch.cdist(xyz[:, :, CA_IDX], xyz[:, :, CA_IDX])
+
+        att_mask = torch.stack(
+            [
+                (pdist < dist_thresh).unsqueeze(1).float()
+                for dist_thresh in self.distance_bins
+            ],
+            dim=1,
+        )
+
+        q, k, v = map(
+            lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.n_heads), (q, k, v)
+        )
+
+        q = q * self.scale
+
+        logits = (
+            torch.einsum("b h i d, b h j d -> b h i j", q, k) + (1.0 - att_mask) * -1e9
+        )
+        att = logits.softmax(dim=-1)
+
+        out = torch.einsum("b h i j, b h j d -> b h i d", att, v)
+        out = rearrange(out, "b h l d -> b l (h d)")
+        msa = msa + self.ln_out(out)
+
+        return self.to_out(msa)
 
 
 class RoseTTAFold(pl.LightningModule):
