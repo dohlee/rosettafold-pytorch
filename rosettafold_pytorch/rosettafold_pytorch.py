@@ -120,7 +120,7 @@ class PositionWiseWeightFactor(nn.Module):
 
 
 class SoftTiedAttentionOverResidues(nn.Module):
-    def __init__(self, d_emb=384, n_heads=12, p_dropout=0.1):
+    def __init__(self, d_emb=384, n_heads=12, p_dropout=0.1, return_att=False):
         super().__init__()
         assert (
             d_emb % n_heads == 0
@@ -129,6 +129,7 @@ class SoftTiedAttentionOverResidues(nn.Module):
         self.n_heads = n_heads
         self.d_head = d_emb // n_heads
         self.scale = self.d_head ** (-0.5)
+        self.return_att = return_att
 
         self.poswise_weight = PositionWiseWeightFactor(d_emb, n_heads, p_dropout)
 
@@ -159,7 +160,10 @@ class SoftTiedAttentionOverResidues(nn.Module):
         out = rearrange(out, "b n h l d -> b n l (h d)")
         out = self.to_out(out)
 
-        return self.dropout(out)
+        if self.return_att:
+            return self.dropout(out), att
+        else:
+            return self.dropout(out)
 
 
 class FeedForward(nn.Module):
@@ -186,16 +190,25 @@ class EncoderLayer(nn.Module):
         tied=False,
         performer=False,
         performer_kws={},
+        return_att=False,
     ):
         super().__init__()
         self.tied = tied
+        self.return_att = return_att
 
-        # Define attention operation
+        # define attention operation
         if self.tied:
             self.attn = SoftTiedAttentionOverResidues(
-                d_emb=d_emb, n_heads=n_heads, p_dropout=p_dropout
+                d_emb=d_emb,
+                n_heads=n_heads,
+                p_dropout=p_dropout,
+                return_att=return_att,
             )
         elif performer:
+            if return_att:
+                raise NotImplementedError(
+                    "PerformerSelfAttention does not support return_att."
+                )
             self.attn = PerformerSelfAttention(
                 dim=d_emb,
                 heads=n_heads,
@@ -205,14 +218,10 @@ class EncoderLayer(nn.Module):
         else:
             raise NotImplementedError
 
-        # Define layer
-        self.att = Residual(
-            nn.Sequential(
-                nn.LayerNorm(d_emb),
-                self.attn,
-                nn.Dropout(p_dropout),
-            ),
-        )
+        # define layers
+        self.ln = nn.LayerNorm(d_emb)
+        self.dropout = nn.Dropout(p_dropout)
+
         self.ff = Residual(
             nn.Sequential(
                 nn.LayerNorm(d_emb),
@@ -227,12 +236,21 @@ class EncoderLayer(nn.Module):
         if not self.tied:
             x = rearrange(x, "b n l d -> (b n) l d")
 
-        x = self.att(x)
+        orig = x
+        x = self.ln(x)
+        if self.return_att:
+            x, att = self.attn(x)
+        else:
+            x = self.attn(x)
+        x = orig + self.dropout(x)
 
         if not self.tied:
             x = rearrange(x, "(b n) l d -> b n l d", n=N)
 
-        return self.ff(x)
+        if self.return_att:
+            return self.ff(x), att
+        else:
+            return self.ff(x)
 
 
 class MsaUpdateUsingSelfAttention(nn.Module):
@@ -246,30 +264,33 @@ class MsaUpdateUsingSelfAttention(nn.Module):
     ):
         super().__init__()
 
-        self.layer = nn.Sequential(
-            EncoderLayer(
-                d_emb=d_emb,
-                d_ff=d_ff,
-                n_heads=n_heads,
-                p_dropout=p_dropout,
-                tied=True,
-                performer=False,
-            ),
-            Rearrange("b n l d -> b l n d"),
-            EncoderLayer(
-                d_emb=d_emb,
-                d_ff=d_ff,
-                n_heads=n_heads,
-                p_dropout=p_dropout,
-                tied=False,
-                performer=True,
-                performer_kws=performer_kws,
-            ),
-            Rearrange("b l n d -> b n l d"),
+        self.residue_wise_encoder = EncoderLayer(
+            d_emb=d_emb,
+            d_ff=d_ff,
+            n_heads=n_heads,
+            p_dropout=p_dropout,
+            tied=True,
+            performer=False,
+            return_att=True,
+        )
+        self.sequence_wise_encoder = EncoderLayer(
+            d_emb=d_emb,
+            d_ff=d_ff,
+            n_heads=n_heads,
+            p_dropout=p_dropout,
+            tied=False,
+            performer=True,
+            performer_kws=performer_kws,
         )
 
     def forward(self, x):
-        return self.layer(x)
+        x, att = self.residue_wise_encoder(x)
+
+        x = rearrange(x, "b n l d -> b n l d")
+        x = self.sequence_wise_encoder(x)
+
+        x = rearrange(x, "b l n d -> b n l d")
+        return x, att
 
 
 class OuterProductMean(nn.Module):
@@ -282,10 +303,9 @@ class OuterProductMean(nn.Module):
     def forward(self, x, y=None):
         y = x if y is None else y
 
-        n = x.size(1)
-        x = (
-            torch.einsum("b n i u, b n j v -> b i j u v", x, y) / n
-        )  # Outer product mean
+        # here we use outer product sum instead of mean,
+        # since we assume that y is already weighted by attention
+        x = torch.einsum("b n i u, b n j v -> b i j u v", x, y)
         x = rearrange(x, "b i j u v -> b i j (u v)")
 
         return self.to_out(x)
@@ -312,15 +332,11 @@ class PairUpdateWithMsa(nn.Module):
             Residual(
                 nn.Sequential(
                     Rearrange("b l1 l2 d -> b d l1 l2"),
-                    nn.Conv2d(
-                        d_pair, d_pair, kernel_size=3, padding="same", bias=False
-                    ),
+                    nn.Conv2d(d_pair, d_pair, kernel_size=3, padding="same", bias=False),
                     nn.InstanceNorm2d(d_pair, affine=True, eps=1e-6),
                     nn.ELU(),
                     nn.Dropout(p_dropout),
-                    nn.Conv2d(
-                        d_pair, d_pair, kernel_size=3, padding="same", bias=False
-                    ),
+                    nn.Conv2d(d_pair, d_pair, kernel_size=3, padding="same", bias=False),
                     nn.InstanceNorm2d(d_pair, affine=True, eps=1e-6),
                     Rearrange("b d l1 l2 -> b l1 l2 d"),
                 )
@@ -337,7 +353,6 @@ class PairUpdateWithMsa(nn.Module):
         w = rearrange(w, "b n 1 l 1 -> b n l 1")  # (b N l 1)
 
         msa_proj_weighted = msa_proj * w
-
         coevol_feat = self.outer_product_mean(msa_proj, msa_proj_weighted)
         coevol_feat = self.ln_coevol_feat(coevol_feat)
 
@@ -405,7 +420,7 @@ class Symmetrization(nn.Module):
         return 0.5 * (x + xt)
 
 
-class MSAUpdateWithPair(nn.Module):
+class MsaUpdateWithPair(nn.Module):
     def __init__(self, d_emb, d_pair, n_heads, p_dropout=0.1):
         super().__init__()
 
@@ -438,9 +453,7 @@ class MSAUpdateWithPair(nn.Module):
         value = self.msa2value(msa)
         att = self.pair2att(pair)
 
-        updated = self.dropout(
-            torch.einsum("b ... h i j, b n h j d -> b n h i d", att, value)
-        )
+        updated = self.dropout(torch.einsum("b ... h i j, b n h j d -> b n h i d", att, value))
 
         return self.ff(msa + updated)
 
@@ -505,14 +518,10 @@ class GraphTransformerBlock(nn.Module):
 
         self.attn = GraphTransformer(d_node_in, d_node_out, d_edge, n_heads, p_dropout)
         self.ln = nn.LayerNorm(d_node_out * n_heads)
-        self.to_out = nn.Sequential(
-            nn.Linear(d_node_out * n_heads, d_node_in), nn.ELU()
-        )
+        self.to_out = nn.Sequential(nn.Linear(d_node_out * n_heads, d_node_in), nn.ELU())
 
     def forward(self, node_feat, edge_feat, edge_mask):
-        return (
-            self.to_out(self.ln(self.attn(node_feat, edge_feat, edge_mask))) + node_feat
-        )
+        return self.to_out(self.ln(self.attn(node_feat, edge_feat, edge_mask))) + node_feat
 
 
 class InitialCoordGenerationWithMsaAndPair(nn.Module):
@@ -589,9 +598,7 @@ class InitialCoordGenerationWithMsaAndPair(nn.Module):
 
 
 class CoordUpdateWithMsaAndPair(nn.Module):
-    def __init__(
-        self, d_emb, d_pair, d_node, d_edge, d_state, n_neighbors, p_dropout=0.1
-    ):
+    def __init__(self, d_emb, d_pair, d_node, d_edge, d_state, n_neighbors, p_dropout=0.1):
         super().__init__()
 
         self.ln_msa = nn.LayerNorm(d_emb)
@@ -646,9 +653,7 @@ class CoordUpdateWithMsaAndPair(nn.Module):
 
 
 class MsaUpdateWithPairAndCoord(nn.Module):
-    def __init__(
-        self, d_emb, d_state, d_ff, distance_bins=[8, 12, 16, 20], p_dropout=0.1
-    ):
+    def __init__(self, d_emb, d_state, d_ff, distance_bins=[8, 12, 16, 20], p_dropout=0.1):
         super().__init__()
 
         self.distance_bins = distance_bins
@@ -671,10 +676,7 @@ class MsaUpdateWithPairAndCoord(nn.Module):
         pdist = torch.cdist(xyz[:, :, CA_IDX], xyz[:, :, CA_IDX])
 
         att_mask = torch.stack(
-            [
-                (pdist < dist_thresh).unsqueeze(1).float()
-                for dist_thresh in self.distance_bins
-            ],
+            [(pdist < dist_thresh).unsqueeze(1).float() for dist_thresh in self.distance_bins],
             dim=1,
         )
 
@@ -684,9 +686,7 @@ class MsaUpdateWithPairAndCoord(nn.Module):
 
         q = q * self.scale
 
-        logits = (
-            torch.einsum("b h i d, b h j d -> b h i j", q, k) + (1.0 - att_mask) * -1e9
-        )
+        logits = torch.einsum("b h i d, b h j d -> b h i j", q, k) + (1.0 - att_mask) * -1e9
         att = logits.softmax(dim=-1)
 
         out = torch.einsum("b h i j, b h j d -> b h i d", att, v)
@@ -700,20 +700,51 @@ class RoseTTAFold(pl.LightningModule):
     def __init__(
         self,
         d_input=21,
-        d_emb=64,
         max_len=5000,
-        p_pe_drop=0.1,
+        p_dropout=0.1,
     ):
         super().__init__()
 
         self.msa_emb = MsaEmbedding(
-            d_input=d_input, d_emb=d_emb, max_len=max_len, p_pe_drop=p_pe_drop
+            d_input=d_input, d_emb=384, max_len=max_len, p_pe_drop=p_dropout
         )
 
-    def forward(self, msa, distogram):
-        msa = self.msa_emb(msa)
+        self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
+            d_emb=384, d_ff=384 * 4, n_heads=12, p_dropout=p_dropout
+        )
 
-        pass
+        self.pair_update_with_msa = PairUpdateWithMsa(d_emb=384, d_proj=32)
+
+        self.pair_update_with_axial_attention = PairUpdateWithAxialAttention(
+            d_pair=288, d_ff=288 * 4, n_heads=8, p_dropout=p_dropout, performer_kws={}
+        )
+
+        self.msa_update_with_pair = MsaUpdateWithPair(
+            d_emb=384, d_pair=288, n_heads=4, p_dropout=0.1
+        )
+
+        self.initial_coord_generation_with_msa_and_pair = InitialCoordGenerationWithMsaAndPair(
+            d_emb=384,
+            d_pair=288,
+            d_node=64,
+            d_edge=64,
+            n_heads=4,
+            n_layers=4,
+            p_dropout=p_dropout,
+        )
+
+        self.coord_update_with_msa_and_pair = CoordUpdateWithMsaAndPair(
+            d_emb=384, d_pair=288, d_node=64, d_edge=64, d_state=32, p_dropout=p_dropout
+        )
+
+    def forward(self, msa, distogram, seq_onehot, aa_pos):
+        msa = self.msa_emb(msa)
+        msa, att = self.msa_update_using_self_att(msa)
+        pair = self.pair_update_with_msa(msa, distogram, att)
+        pair = self.pair_update_with_axial_attention(pair)
+        msa = self.msa_update_with_pair(msa, pair)
+        xyz = self.initial_coord_generation_with_msa_and_pair(msa, pair, seq_onehot, aa_pos)
+        xyz = self.coord_update_with_msa_and_pair(xyz, msa, pair, seq_onehot)
 
     def training_step(self, batch, batch_idx):
         pass
