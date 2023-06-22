@@ -22,7 +22,7 @@ setup(
         "numpy",
         "torch>=1.6",
         "performer-pytorch",
-        "se3_transformer_pytorch",
+        "lie-learn",
     ],
     classifiers=[
         "Development Status :: 4 - Beta",
