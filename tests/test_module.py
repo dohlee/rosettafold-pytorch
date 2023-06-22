@@ -10,14 +10,20 @@ from rosettafold_pytorch.rosettafold_pytorch import (
     EncoderLayer,
     MsaEmbedding,
     MsaUpdateUsingSelfAttention,
-    MSAUpdateWithPair,
     OuterProductMean,
     PairUpdateWithAxialAttention,
     PairUpdateWithMsa,
     PositionWiseWeightFactor,
     SoftTiedAttentionOverResidues,
+    Symmetrization,
+    MsaUpdateWithPair,
     GraphTransformer,
     InitialCoordGenerationWithMsaAndPair,
+    CoordUpdateWithMsaAndPair,
+    MsaUpdateWithPairAndCoord,
+    TwoTrackBlock,
+    ThreeTrackBlock,
+    RoseTTAFold,
 )
 
 
@@ -136,9 +142,7 @@ def test_EncoderLayer_tied_init():
     d_emb, n_heads = 64, 4
     d_ff = d_emb * 4
 
-    enc = EncoderLayer(
-        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, tied=True
-    )
+    enc = EncoderLayer(d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, tied=True)
     assert enc is not None
 
 
@@ -146,9 +150,7 @@ def test_EncoderLayer_performer_init():
     d_emb, n_heads = 64, 4
     d_ff = d_emb * 4
 
-    enc = EncoderLayer(
-        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, performer=True
-    )
+    enc = EncoderLayer(d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, performer=True)
     assert enc is not None
 
 
@@ -161,9 +163,7 @@ def test_EncoderLayer_tied_shape():
     msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
-    enc = EncoderLayer(
-        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, tied=True
-    )
+    enc = EncoderLayer(d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, tied=True)
 
     assert enc(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
 
@@ -177,9 +177,7 @@ def test_EncoderLayer_performer_shape():
     msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
     msa_emb = msa_embedder(msa)
 
-    enc = EncoderLayer(
-        d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, performer=True
-    )
+    enc = EncoderLayer(d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1, performer=True)
 
     assert enc(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
 
@@ -209,7 +207,9 @@ def test_MsaUpdateUsingSelfAttention_shape():
         d_emb=d_emb, d_ff=d_ff, n_heads=n_heads, p_dropout=0.1
     )
 
-    assert msa_update(msa_emb).shape == (bsz, n_seq, max_len, d_emb)
+    x, att = msa_update(msa_emb)
+    assert x.shape == (bsz, n_seq, max_len, d_emb)
+    assert att.shape == (bsz, max_len, max_len, n_heads)
 
 
 # OuterProductMean
@@ -301,15 +301,39 @@ def test_PairUpdateWithAxialAttention_shape():
     assert pair_update(pair).shape == (bsz, max_len, max_len, d_pair)
 
 
-# MSAUpdateWithPair
+# Symmetrization
+def test_Symmetrization():
+    sym = Symmetrization()
+    assert sym is not None
+
+    x = torch.randn(4, 10, 10, 8)
+    x_sym = sym(x)
+    assert x_sym.shape == (4, 10, 10, 8)
+    assert (x_sym == x_sym.transpose(-2, -3)).all()
+
+
+# MsaUpdateWithPair
 def test_MSAUpdateWithPair_init():
     d_emb, d_pair, n_heads = 16, 4, 2
 
-    msa_update = MSAUpdateWithPair(
-        d_emb=d_emb, d_pair=d_pair, n_heads=n_heads, p_dropout=0.1
-    )
+    msa_update = MsaUpdateWithPair(d_emb=d_emb, d_pair=d_pair, n_heads=n_heads, p_dropout=0.1)
 
     assert msa_update is not None
+
+
+def test_MSAUpdateWithPair_shape():
+    d_emb, d_pair, n_heads = 16, 4, 2
+    bsz, n_seq, max_len = 4, 10, 64
+
+    msa = torch.randint(0, 21, (bsz, n_seq, max_len))
+    msa_embedder = MsaEmbedding(d_input=21, d_emb=d_emb, max_len=max_len, p_pe_drop=0.1)
+    msa = msa_embedder(msa)
+
+    pair = torch.randn(bsz, max_len, max_len, d_pair)
+    msa_update = MsaUpdateWithPair(d_emb=d_emb, d_pair=d_pair, n_heads=n_heads, p_dropout=0.1)
+
+    assert msa_update is not None
+    assert msa_update(msa, pair).shape == (bsz, n_seq, max_len, d_emb)
 
 
 # GraphTransformer
@@ -410,3 +434,148 @@ def test_InitialCoordGenerationWithMsaAndPair_shape():
         3,
         3,
     )
+
+
+# CoordUpdateWithMsaAndPair
+def test_CoordUpdateWithMsaAndPair_init():
+    d_emb, d_pair = 16, 16
+    d_node, d_edge = 8, 8
+    d_state, n_neighbors = 8, 4
+
+    coord_update = CoordUpdateWithMsaAndPair(
+        d_emb=d_emb,
+        d_pair=d_pair,
+        d_node=d_node,
+        d_edge=d_edge,
+        d_state=d_state,
+        n_neighbors=n_neighbors,
+    )
+    assert coord_update is not None
+
+
+def test_CoordUpdateWithMsaAndPair_shape():
+    d_emb, d_pair = 16, 16
+    d_node, d_edge = 8, 8
+    d_state, n_neighbors = 8, 4
+
+    coord_update = CoordUpdateWithMsaAndPair(
+        d_emb=d_emb,
+        d_pair=d_pair,
+        d_node=d_node,
+        d_edge=d_edge,
+        d_state=d_state,
+        n_neighbors=n_neighbors,
+    )
+    assert coord_update is not None
+
+    bsz, n_seq, max_len = 4, 10, 64
+
+    xyz = torch.randn(bsz, max_len, 3, 3)
+    msa = torch.randn(bsz, n_seq, max_len, d_emb)
+    pair = torch.randn(bsz, max_len, max_len, d_pair)
+    aa_idx = torch.randint(0, max_len, (bsz, max_len))
+    seq_onehot = F.one_hot(torch.randint(0, 21, (bsz, max_len)), num_classes=21).float()
+
+    state, xyz = coord_update(xyz, msa, pair, aa_idx, seq_onehot)
+    assert state.shape == (bsz, max_len, d_state)
+    assert xyz.shape == (bsz, max_len, 3, 3)
+
+
+# MsaUpdateWithPairAndCoord
+def test_MsaUpdateWithPairAndCoord_init():
+    d_emb, d_state = 16, 8
+    d_trfm_inner, d_ff = 32, 64
+    distance_bins = [8, 12, 16, 20]
+
+    msa_update = MsaUpdateWithPairAndCoord(
+        d_emb=d_emb,
+        d_state=d_state,
+        d_trfm_inner=d_trfm_inner,
+        d_ff=d_ff,
+        distance_bins=distance_bins,
+        p_dropout=0.1,
+    )
+    assert msa_update is not None
+
+
+def test_MsaUpdateWithPairAndCoord_shape():
+    d_emb, d_state = 16, 8
+    d_trfm_inner, d_ff = 32, 64
+    distance_bins = [8, 12, 16, 20]
+
+    msa_update = MsaUpdateWithPairAndCoord(
+        d_emb=d_emb,
+        d_state=d_state,
+        d_trfm_inner=d_trfm_inner,
+        d_ff=d_ff,
+        distance_bins=distance_bins,
+        p_dropout=0.1,
+    )
+    assert msa_update is not None
+
+    bsz, n_seq, max_len = 4, 10, 64
+
+    xyz = torch.randn(bsz, max_len, 3, 3)
+    state = torch.randn(bsz, max_len, d_state)
+    msa = torch.randn(bsz, n_seq, max_len, d_emb)
+
+    msa = msa_update(xyz, state, msa)
+    assert msa.shape == (bsz, n_seq, max_len, d_emb)
+
+
+# TwoTrackBlock
+def test_TwoTrackBlock_init():
+    p_dropout = 0.1
+
+    block = TwoTrackBlock(p_dropout=p_dropout)
+
+    assert block is not None
+
+
+def test_TwoTrackBlock_shape():
+    d_emb, d_pair = 384, 288
+    bsz, n_seq, max_len = 4, 10, 64
+
+    msa = torch.randn(bsz, n_seq, max_len, d_emb)
+    pair = torch.randn(bsz, max_len, max_len, d_pair)
+
+    block = TwoTrackBlock(p_dropout=0.1)
+    msa, pair = block(msa, pair)
+
+    assert msa.shape == (bsz, n_seq, max_len, d_emb)
+    assert pair.shape == (bsz, max_len, max_len, d_pair)
+
+
+# ThreeTrackBlock
+def test_ThreeTrackBlock_init():
+    p_dropout = 0.1
+    n_neighbors = 128
+
+    block = ThreeTrackBlock(
+        n_neighbors=n_neighbors,
+        p_dropout=p_dropout,
+    )
+
+    assert block is not None
+
+
+def test_ThreeTrackBlock_shape():
+    d_emb, d_pair = 384, 288
+    bsz, n_seq, max_len = 4, 10, 64
+    n_neighbors, p_dropout = 128, 0.1
+
+    msa = torch.randn(bsz, n_seq, max_len, d_emb)
+    pair = torch.randn(bsz, max_len, max_len, d_pair)
+    xyz = torch.randn(bsz, max_len, 3, 3)
+    aa_idx = torch.randint(0, max_len, (bsz, max_len))
+    seq_onehot = F.one_hot(torch.randint(0, 21, (bsz, max_len)), num_classes=21).float()
+
+    block = ThreeTrackBlock(
+        n_neighbors=n_neighbors,
+        p_dropout=p_dropout,
+    )
+    msa, pair, xyz = block(msa, pair, xyz, seq_onehot, aa_idx)
+
+    assert msa.shape == (bsz, n_seq, max_len, d_emb)
+    assert pair.shape == (bsz, max_len, max_len, d_pair)
+    assert xyz.shape == (bsz, max_len, 3, 3)

@@ -1,5 +1,6 @@
 import math
 
+import dgl
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -7,7 +8,10 @@ import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from performer_pytorch import SelfAttention as PerformerSelfAttention
-from se3_transformer_pytorch import SE3Transformer
+
+from .se3_modules import SE3Transformer
+
+N_IDX, CA_IDX, C_IDX = 0, 1, 2
 
 
 class Residual(nn.Module):
@@ -153,14 +157,17 @@ class SoftTiedAttentionOverResidues(nn.Module):
         # poswise_weight : (b n h l 1)
         q = q * self.poswise_weight(x) * self.scale
 
-        logits = torch.einsum("b n h i d, b n h j d -> b n h i j", q, k)
+        logits = torch.einsum("b n h i d, b n h j d -> b h i j", q, k)
         att = logits.softmax(dim=-1)
 
-        out = torch.einsum("b n h i j, b n h j d -> b n h i d", att, v)
+        out = torch.einsum("b h i j, b n h j d -> b n h i d", att, v)
         out = rearrange(out, "b n h l d -> b n l (h d)")
         out = self.to_out(out)
 
         if self.return_att:
+            # symmetrize attention
+            att = (att + rearrange(att, "b h i j -> b h j i")) * 0.5
+            att = rearrange(att, "b h i j -> b i j h")
             return self.dropout(out), att
         else:
             return self.dropout(out)
@@ -286,7 +293,7 @@ class MsaUpdateUsingSelfAttention(nn.Module):
     def forward(self, x):
         x, att = self.residue_wise_encoder(x)
 
-        x = rearrange(x, "b n l d -> b n l d")
+        x = rearrange(x, "b n l d -> b l n d")
         x = self.sequence_wise_encoder(x)
 
         x = rearrange(x, "b l n d -> b n l d")
@@ -327,6 +334,7 @@ class PairUpdateWithMsa(nn.Module):
         self.ln_pair = nn.LayerNorm(d_pair)
 
         d_feat_full = d_pair * 2 + d_proj * 4 + n_heads
+
         self.resnet = nn.Sequential(
             nn.Linear(d_feat_full, d_pair),
             Residual(
@@ -447,13 +455,14 @@ class MsaUpdateWithPair(nn.Module):
             p_dropout=p_dropout,
         )
 
-        self.dropout1 = nn.Dropout(p_dropout)
+        self.dropout = nn.Dropout(p_dropout)
 
     def forward(self, msa, pair):
         value = self.msa2value(msa)
         att = self.pair2att(pair)
 
         updated = self.dropout(torch.einsum("b ... h i j, b n h j d -> b n h i d", att, value))
+        updated = rearrange(updated, "b n h i d -> b n i (h d)")
 
         return self.ff(msa + updated)
 
@@ -551,23 +560,7 @@ class InitialCoordGenerationWithMsaAndPair(nn.Module):
 
         self.to_out = nn.Linear(d_node, 9)
 
-    def _sequence_separation_matrix(self, aa_pos):
-        """Featurize the distance between amino acid sequence.
-        Given two amino acid positions, i and j, the sequence separation feature
-        is defined as sign(j - i) * log(|j - i| + 1)
-
-        Args:
-            aa_pos, (b l): the position of amino acids in the sequence.
-
-        Returns:
-            (b l l 1): sequence separation feature.
-        """
-        dist = aa_pos.unsqueeze(-1) - aa_pos.unsqueeze(-2)  # All-pairwise diff
-        dist = torch.sign(dist) * torch.log(torch.abs(dist) + 1)
-
-        return dist.clamp(0.0, 5.5).unsqueeze(-1)
-
-    def forward(self, msa, pair, seq_onehot, aa_pos):
+    def forward(self, msa, pair, seq_onehot, aa_idx):
         """
         Args:
             msa, (b n l d): MSA features.
@@ -588,7 +581,7 @@ class InitialCoordGenerationWithMsaAndPair(nn.Module):
         node = self.node_embed(node)
 
         # Attach sequence separation feature to pair feature.
-        edge = torch.cat([pair, self._sequence_separation_matrix(aa_pos)], dim=-1)
+        edge = torch.cat([pair, self._sequence_separation_matrix(aa_idx)], dim=-1)
         edge = self.edge_embed(edge)
 
         for block in self.blocks:
@@ -596,10 +589,28 @@ class InitialCoordGenerationWithMsaAndPair(nn.Module):
 
         return rearrange(self.to_out(node), "b l (a xyz) -> b l a xyz", a=3, xyz=3)
 
+    def _sequence_separation_matrix(self, aa_idx):
+        """Featurize the distance between amino acid sequence.
+        Given two amino acid positions, i and j, the sequence separation feature
+        is defined as sign(j - i) * log(|j - i| + 1)
+
+        Args:
+            aa_pos, (b l): the position of amino acids in the sequence.
+
+        Returns:
+            (b l l 1): sequence separation feature.
+        """
+        dist = aa_idx.unsqueeze(-1) - aa_idx.unsqueeze(-2)  # All-pairwise diff
+        dist = torch.sign(dist) * torch.log(torch.abs(dist) + 1)
+
+        return dist.clamp(0.0, 5.5).unsqueeze(-1)
+
 
 class CoordUpdateWithMsaAndPair(nn.Module):
     def __init__(self, d_emb, d_pair, d_node, d_edge, d_state, n_neighbors, p_dropout=0.1):
         super().__init__()
+
+        self.n_neighbors = n_neighbors
 
         self.ln_msa = nn.LayerNorm(d_emb)
         self.ln_pair = nn.LayerNorm(d_pair)
@@ -608,29 +619,30 @@ class CoordUpdateWithMsaAndPair(nn.Module):
         self.node_embed = nn.Sequential(
             nn.Linear(d_emb + 21, d_node),
             nn.ELU(),
+            nn.LayerNorm(d_node),
         )
 
         self.edge_embed = nn.Sequential(
-            nn.Linear(d_pair + 1, d_edge),
+            nn.Linear(d_pair, d_edge),
             nn.ELU(),
+            nn.LayerNorm(d_edge),
         )
-        # SE(3) equivariant GCN with attention
-        # def __init__(self, num_layers=2, num_channels=32, num_degrees=3, n_heads=4, div=4,
-        #              si_m='1x1', si_e='att',
-        #              l0_in_features=32, l0_out_features=32,
-        #              l1_in_features=3, l1_out_features=3,
-        #              num_edge_features=32, x_ij=None):
 
         self.se3_transformer = SE3Transformer(
-            n_layers=2,
+            num_layers=2,
+            num_channels=16,
             n_heads=4,
+            num_degrees=2,
             l0_in_features=d_node,
+            l1_in_features=3,
             l0_out_features=d_state,
-            edge_dim=d_edge,
-            num_neighbors=n_neighbors,
+            l1_out_features=3,
+            num_edge_features=d_edge,
         )
 
-    def forward(self, xyz, msa, pair, seq_onehot):
+    def forward(self, xyz, msa, pair, aa_idx, seq_onehot):
+        bsz = xyz.size(0)
+
         msa = self.ln_msa(msa)  # (b N l d)
         pair = self.ln_pair(pair)  # (b l l d)
 
@@ -640,20 +652,77 @@ class CoordUpdateWithMsaAndPair(nn.Module):
 
         # Compute the node feature.
         node = torch.cat([(msa * w).sum(dim=1), seq_onehot], dim=-1)
-        node = self.node_embed(node)  # (b N d_node)
+        node = self.node_embed(node)  # (b l d_node)
 
         # Attach sequence separation feature to pair feature.
-        edge = self.edge_embed(pair)  # (b N d_edge)
+        edge = self.edge_embed(pair)  # (b l d_edge)
 
-        # TODO: define mask
-        mask = None
+        G = self._knn_graph(xyz, edge, aa_idx, n_neighbors=self.n_neighbors)
 
-        out = self.se3_transformer(node, xyz, mask, edge)
-        return out["0"], out["1"]
+        type0_feat = rearrange(node, "b l d -> (b l) d ()")
+
+        type1_feat = xyz - xyz[:, :, CA_IDX].unsqueeze(-2)
+        type1_feat = rearrange(type1_feat, "b l a xyz -> (b l) a xyz")
+
+        out = self.se3_transformer(G, type0_feat, type1_feat)
+        state, displacement = out["0"], out["1"]
+
+        state = rearrange(state, "(b l) d () -> b l d", b=bsz)
+        displacement = rearrange(displacement, "(b l) a xyz -> b l a xyz", b=bsz)
+
+        ca_xyz = xyz[:, :, CA_IDX] + displacement[:, :, CA_IDX]
+        n_xyz = ca_xyz + displacement[:, :, N_IDX]
+        c_xyz = ca_xyz + displacement[:, :, C_IDX]
+        xyz = torch.stack([n_xyz, ca_xyz, c_xyz], dim=2)
+
+        return state, xyz
+
+    def _knn_graph(self, xyz, edge, idx, n_neighbors=64, kmin=9):
+        """
+        Adopted from
+        https://github.com/RosettaCommons/RoseTTAFold/blob/main/network/Attention_module_w_str.py#L19
+        """
+        B, L = xyz.shape[:2]
+        device = xyz.device
+
+        # pairwise distance between CA atoms
+        # NOTE: self-interactions are excluded
+        pdist = torch.cdist(xyz[:, :, CA_IDX], xyz[:, :, CA_IDX])
+        pdist += torch.eye(L, device=device).unsqueeze(0) * 1e3
+
+        # 1D-distance between residues in amino acid sequence
+        sep = idx[:, None, :] - idx[:, :, None]
+        sep = sep.abs() + torch.eye(L, device=device).unsqueeze(0) * 999.9
+
+        # get top_k neighbors
+        n_neighbors = min(n_neighbors, L)
+
+        # E_idx: (B, L, n_neighbors)
+        _, neighbor_idx = torch.topk(pdist, n_neighbors, largest=False)
+
+        adj = torch.zeros((B, L, L), device=device)
+        adj = adj.scatter(dim=2, index=neighbor_idx, value=1.0)
+
+        # put an edge if any of the 3 conditions are met:
+        #   1) |i-j| <= kmin (connect sequentially adjacent residues)
+        #   2) top_k neighbors
+        cond = torch.logical_or(adj > 0.0, sep < kmin)
+        b, i, j = torch.where(cond)
+
+        edge_idx = (b * L + i, b * L + j)
+        G = dgl.graph(edge_idx, num_nodes=B * L).to(device)
+
+        # no gradient through basis function
+        G.edata["d"] = (xyz[b, j, CA_IDX] - xyz[b, i, CA_IDX]).detach()
+        G.edata["w"] = edge[b, i, j]
+
+        return G
 
 
 class MsaUpdateWithPairAndCoord(nn.Module):
-    def __init__(self, d_emb, d_state, d_ff, distance_bins=[8, 12, 16, 20], p_dropout=0.1):
+    def __init__(
+        self, d_emb, d_state, d_trfm_inner, d_ff, distance_bins=[8, 12, 16, 20], p_dropout=0.1
+    ):
         super().__init__()
 
         self.distance_bins = distance_bins
@@ -664,36 +733,154 @@ class MsaUpdateWithPairAndCoord(nn.Module):
         self.ln_msa = nn.LayerNorm(d_emb)
         self.ln_state = nn.LayerNorm(d_state)
 
-        self.to_out = nn.Sequential(
-            nn.Residual(nn.LayerNorm(d_emb), FeedForward(d_emb, d_ff, p_dropout))
+        self.to_q = nn.Linear(d_state, d_trfm_inner * self.n_heads)
+        self.to_k = nn.Linear(d_state, d_trfm_inner * self.n_heads)
+        self.to_v = nn.Linear(d_emb, d_emb)
+
+        self.ln_out = nn.LayerNorm(d_emb)
+        self.to_out = Residual(
+            nn.Sequential(
+                nn.LayerNorm(d_emb),
+                FeedForward(d_emb, d_ff, p_dropout),
+            )
         )
 
     def forward(self, xyz, state, msa):
-        q = k = self.ln_state(state)
-        v = self.ln_msa(msa)
+        state = self.ln_state(state)
+        msa = self.ln_msa(msa)
 
-        CA_IDX = 1
+        q = self.to_q(state)
+        k = self.to_k(state)
+        v = self.to_v(msa)
+
+        # compose attention mask according to the Euclidean distance
+        # between atoms
         pdist = torch.cdist(xyz[:, :, CA_IDX], xyz[:, :, CA_IDX])
-
-        att_mask = torch.stack(
+        att_mask = torch.cat(
             [(pdist < dist_thresh).unsqueeze(1).float() for dist_thresh in self.distance_bins],
             dim=1,
         )
 
-        q, k, v = map(
-            lambda t: rearrange(t, "b l (h d) -> b h l d", h=self.n_heads), (q, k, v)
-        )
+        q = rearrange(q, "b l (h d) -> b h l d", h=self.n_heads)
+        k = rearrange(k, "b l (h d) -> b h l d", h=self.n_heads)
+        v = rearrange(v, "b n l (h d) -> b h n l d", h=self.n_heads)
 
         q = q * self.scale
 
         logits = torch.einsum("b h i d, b h j d -> b h i j", q, k) + (1.0 - att_mask) * -1e9
         att = logits.softmax(dim=-1)
 
-        out = torch.einsum("b h i j, b h j d -> b h i d", att, v)
-        out = rearrange(out, "b h l d -> b l (h d)")
+        out = torch.einsum("b h i j, b h n j d -> b h n i d", att, v)
+        out = rearrange(out, "b h n l d -> b n l (h d)")
         msa = msa + self.ln_out(out)
 
         return self.to_out(msa)
+
+
+class TwoTrackBlock(nn.Module):
+    def __init__(self, p_dropout=0.1):
+        super().__init__()
+
+        self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
+            d_emb=384,
+            d_ff=384 * 4,
+            n_heads=12,
+            p_dropout=p_dropout,
+        )
+
+        self.pair_update_with_msa = PairUpdateWithMsa(
+            d_pair=288,
+            n_heads=12,
+            d_emb=384,
+            d_proj=32,
+        )
+
+        self.pair_update_with_axial_attention = PairUpdateWithAxialAttention(
+            d_pair=288,
+            d_ff=288 * 4,
+            n_heads=8,
+            p_dropout=p_dropout,
+            performer_kws={},
+        )
+
+        self.msa_update_with_pair = MsaUpdateWithPair(
+            d_emb=384,
+            d_pair=288,
+            n_heads=4,
+            p_dropout=0.1,
+        )
+
+    def forward(self, msa, pair):
+        msa, att = self.msa_update_using_self_att(msa)
+        pair = self.pair_update_with_msa(msa, pair, att)
+        pair = self.pair_update_with_axial_attention(pair)
+        msa = self.msa_update_with_pair(msa, pair)
+
+        return msa, pair
+
+
+class ThreeTrackBlock(nn.Module):
+    def __init__(self, n_neighbors, p_dropout):
+        super().__init__()
+
+        self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
+            d_emb=384,
+            d_ff=384 * 4,
+            n_heads=12,
+            p_dropout=p_dropout,
+        )
+
+        self.pair_update_with_msa = PairUpdateWithMsa(
+            d_pair=288,
+            n_heads=12,
+            d_emb=384,
+            d_proj=32,
+        )
+
+        self.pair_update_with_axial_attention = PairUpdateWithAxialAttention(
+            d_pair=288,
+            d_ff=288 * 4,
+            n_heads=8,
+            p_dropout=p_dropout,
+            performer_kws={},
+        )
+
+        self.msa_update_with_pair = MsaUpdateWithPair(
+            d_emb=384,
+            d_pair=288,
+            n_heads=4,
+            p_dropout=0.1,
+        )
+
+        self.coord_update_with_msa_and_pair = CoordUpdateWithMsaAndPair(
+            d_emb=384,
+            d_pair=288,
+            d_node=64,
+            d_edge=64,
+            d_state=32,
+            n_neighbors=n_neighbors,
+            p_dropout=p_dropout,
+        )
+
+        self.msa_update_with_pair_and_coord = MsaUpdateWithPairAndCoord(
+            d_emb=384,
+            d_state=32,
+            d_trfm_inner=32,
+            d_ff=384 * 4,
+            distance_bins=[8, 12, 16, 20],
+            p_dropout=p_dropout,
+        )
+
+    def forward(self, msa, pair, xyz, seq_onehot, aa_idx):
+        msa, att = self.msa_update_using_self_att(msa)
+        pair = self.pair_update_with_msa(msa, pair, att)
+        pair = self.pair_update_with_axial_attention(pair)
+        msa = self.msa_update_with_pair(msa, pair)
+
+        state, xyz = self.coord_update_with_msa_and_pair(xyz, msa, pair, aa_idx, seq_onehot)
+        msa = self.msa_update_with_pair_and_coord(xyz, state, msa)
+
+        return msa, pair, xyz
 
 
 class RoseTTAFold(pl.LightningModule):
@@ -701,26 +888,16 @@ class RoseTTAFold(pl.LightningModule):
         self,
         d_input=21,
         max_len=5000,
+        n_neighbors=128,
         p_dropout=0.1,
     ):
         super().__init__()
 
         self.msa_emb = MsaEmbedding(
-            d_input=d_input, d_emb=384, max_len=max_len, p_pe_drop=p_dropout
-        )
-
-        self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
-            d_emb=384, d_ff=384 * 4, n_heads=12, p_dropout=p_dropout
-        )
-
-        self.pair_update_with_msa = PairUpdateWithMsa(d_emb=384, d_proj=32)
-
-        self.pair_update_with_axial_attention = PairUpdateWithAxialAttention(
-            d_pair=288, d_ff=288 * 4, n_heads=8, p_dropout=p_dropout, performer_kws={}
-        )
-
-        self.msa_update_with_pair = MsaUpdateWithPair(
-            d_emb=384, d_pair=288, n_heads=4, p_dropout=0.1
+            d_input=d_input,
+            d_emb=384,
+            max_len=max_len,
+            p_pe_drop=p_dropout,
         )
 
         self.initial_coord_generation_with_msa_and_pair = InitialCoordGenerationWithMsaAndPair(
@@ -733,18 +910,8 @@ class RoseTTAFold(pl.LightningModule):
             p_dropout=p_dropout,
         )
 
-        self.coord_update_with_msa_and_pair = CoordUpdateWithMsaAndPair(
-            d_emb=384, d_pair=288, d_node=64, d_edge=64, d_state=32, p_dropout=p_dropout
-        )
-
-    def forward(self, msa, distogram, seq_onehot, aa_pos):
-        msa = self.msa_emb(msa)
-        msa, att = self.msa_update_using_self_att(msa)
-        pair = self.pair_update_with_msa(msa, distogram, att)
-        pair = self.pair_update_with_axial_attention(pair)
-        msa = self.msa_update_with_pair(msa, pair)
-        xyz = self.initial_coord_generation_with_msa_and_pair(msa, pair, seq_onehot, aa_pos)
-        xyz = self.coord_update_with_msa_and_pair(xyz, msa, pair, seq_onehot)
+    def forward(self, msa, pair, seq_onehot, aa_idx):
+        xyz = self.initial_coord_generation_with_msa_and_pair(msa, pair, seq_onehot, aa_idx)
 
     def training_step(self, batch, batch_idx):
         pass
