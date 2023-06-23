@@ -373,34 +373,49 @@ class MsaUpdateUsingSelfAttention(nn.Module):
         d_ff=384 * 4,
         n_heads=12,
         p_dropout=0.1,
+        n_encoder_layers=4,
         performer_kws={},
     ):
         super().__init__()
 
-        self.residue_wise_encoder = EncoderLayer(
-            d_emb=d_emb,
-            d_ff=d_ff,
-            n_heads=n_heads,
-            p_dropout=p_dropout,
-            tied=True,
-            performer=False,
-            return_att=True,
+        self.residue_wise_encoder_layers = nn.ModuleList(
+            [
+                EncoderLayer(
+                    d_emb=d_emb,
+                    d_ff=d_ff,
+                    n_heads=n_heads,
+                    p_dropout=p_dropout,
+                    tied=True,
+                    performer=False,
+                    return_att=True,
+                )
+                for _ in range(n_encoder_layers)
+            ]
         )
-        self.sequence_wise_encoder = EncoderLayer(
-            d_emb=d_emb,
-            d_ff=d_ff,
-            n_heads=n_heads,
-            p_dropout=p_dropout,
-            tied=False,
-            performer=True,
-            performer_kws=performer_kws,
+
+        self.sequence_wise_encoder_layers = nn.ModuleList(
+            [
+                EncoderLayer(
+                    d_emb=d_emb,
+                    d_ff=d_ff,
+                    n_heads=n_heads,
+                    p_dropout=p_dropout,
+                    tied=False,
+                    performer=True,
+                    performer_kws=performer_kws,
+                )
+                for _ in range(n_encoder_layers)
+            ]
         )
 
     def forward(self, x):
-        x, att = self.residue_wise_encoder(x)
+        for layer in self.residue_wise_encoder_layers:
+            x, att = layer(x)
 
         x = rearrange(x, "b n l d -> b l n d")
-        x = self.sequence_wise_encoder(x)
+
+        for layer in self.sequence_wise_encoder_layers:
+            x = layer(x)
 
         x = rearrange(x, "b l n d -> b n l d")
         return x, att
@@ -495,8 +510,8 @@ class PairUpdateWithMsa(nn.Module):
         return self.resnet(feat)
 
 
-class PairUpdateWithAxialAttention(nn.Module):
-    def __init__(self, d_pair, d_ff, n_heads, p_dropout, performer_kws={}):
+class PairUpdateWithAxialAttentionLayer(nn.Module):
+    def __init__(self, d_pair, d_ff, n_heads, p_dropout, performer_kws):
         super().__init__()
 
         self.row_attn = PerformerSelfAttention(
@@ -525,6 +540,25 @@ class PairUpdateWithAxialAttention(nn.Module):
         return self.layer(x)
 
 
+class PairUpdateWithAxialAttention(nn.Module):
+    def __init__(self, d_pair, d_ff, n_heads, p_dropout, n_encoder_layers, performer_kws={}):
+        super().__init__()
+
+        self.layers = nn.ModuleList(
+            [
+                PairUpdateWithAxialAttentionLayer(
+                    d_pair, d_ff, n_heads, p_dropout, performer_kws
+                )
+                for _ in range(n_encoder_layers)
+            ]
+        )
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 class Symmetrization(nn.Module):
     def __init__(self):
         super().__init__()
@@ -534,7 +568,7 @@ class Symmetrization(nn.Module):
         return 0.5 * (x + xt)
 
 
-class MsaUpdateWithPair(nn.Module):
+class MsaUpdateWithPairLayer(nn.Module):
     def __init__(self, d_emb, d_pair, n_heads, p_dropout=0.1):
         super().__init__()
 
@@ -571,6 +605,21 @@ class MsaUpdateWithPair(nn.Module):
         updated = rearrange(updated, "b n h i d -> b n i (h d)")
 
         return self.ff(msa + updated)
+
+
+class MsaUpdateWithPair(nn.Module):
+    def __init__(self, d_emb, d_pair, n_heads, n_encoder_layers=4, p_dropout=0.1):
+        super().__init__()
+
+        self.encoder_layers = [
+            MsaUpdateWithPairLayer(d_emb, d_pair, n_heads, p_dropout)
+            for _ in range(n_encoder_layers)
+        ]
+
+    def forward(self, msa, pair):
+        for layer in self.encoder_layers:
+            msa = layer(msa, pair)
+        return msa
 
 
 class GraphTransformer(nn.Module):
@@ -884,13 +933,17 @@ class MsaUpdateWithPairAndCoord(nn.Module):
 
 
 class TwoTrackBlock(nn.Module):
-    def __init__(self, p_dropout=0.1):
+    def __init__(self, n_encoder_layers, p_dropout=0.1):
+        """
+        n_encoder_layers: number of encoder layers for modules using transformer encoders at their core.
+        """
         super().__init__()
 
         self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
             d_emb=384,
             d_ff=384 * 4,
             n_heads=12,
+            n_encoder_layers=n_encoder_layers,
             p_dropout=p_dropout,
         )
 
@@ -906,6 +959,7 @@ class TwoTrackBlock(nn.Module):
             d_ff=288 * 4,
             n_heads=8,
             p_dropout=p_dropout,
+            n_encoder_layers=n_encoder_layers,
             performer_kws={},
         )
 
@@ -913,6 +967,7 @@ class TwoTrackBlock(nn.Module):
             d_emb=384,
             d_pair=288,
             n_heads=4,
+            n_encoder_layers=n_encoder_layers,
             p_dropout=0.1,
         )
 
@@ -926,53 +981,65 @@ class TwoTrackBlock(nn.Module):
 
 
 class ThreeTrackBlock(nn.Module):
-    def __init__(self, n_neighbors, p_dropout):
+    def __init__(self, n_encoder_layers, n_neighbors, p_dropout):
+        """
+        n_encoder_layers: number of encoder layers for modules using transformer encoders at their core.
+        """
         super().__init__()
 
+        d_msa = 384
+        d_pair = 288
+        d_node = 64
+        d_edge = 64
+        d_state = 32
+
         self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
-            d_emb=384,
-            d_ff=384 * 4,
+            d_emb=d_msa,
+            d_ff=d_msa * 4,
             n_heads=12,
+            n_encoder_layers=n_encoder_layers,
             p_dropout=p_dropout,
         )
 
         self.pair_update_with_msa = PairUpdateWithMsa(
-            d_pair=288,
+            d_pair=d_pair,
             n_heads=12,
-            d_emb=384,
+            d_emb=d_msa,
             d_proj=32,
         )
 
         self.pair_update_with_axial_attention = PairUpdateWithAxialAttention(
-            d_pair=288,
-            d_ff=288 * 4,
+            d_pair=d_pair,
+            d_ff=d_pair * 4,
             n_heads=8,
             p_dropout=p_dropout,
+            n_encoder_layers=n_encoder_layers,
             performer_kws={},
         )
 
         self.msa_update_with_pair = MsaUpdateWithPair(
             d_emb=384,
-            d_pair=288,
+            d_pair=d_pair,
             n_heads=4,
+            n_encoder_layers=n_encoder_layers,
             p_dropout=0.1,
         )
 
         self.coord_update_with_msa_and_pair = CoordUpdateWithMsaAndPair(
-            d_emb=384,
-            d_pair=288,
-            d_node=64,
-            d_edge=64,
+            d_emb=d_msa,
+            d_pair=d_pair,
+            d_node=d_node,
+            d_edge=d_edge,
             d_state=32,
             n_neighbors=n_neighbors,
             p_dropout=p_dropout,
         )
 
         self.msa_update_with_pair_and_coord = MsaUpdateWithPairAndCoord(
-            d_emb=384,
+            d_emb=d_msa,
             d_state=32,
             d_trfm_inner=32,
-            d_ff=384 * 4,
+            d_ff=d_msa * 4,
             distance_bins=[8, 12, 16, 20],
             p_dropout=p_dropout,
         )
@@ -989,21 +1056,117 @@ class ThreeTrackBlock(nn.Module):
         return msa, pair, xyz
 
 
+class FinalBlock(nn.Module):
+    def __init__(self, n_encoder_layers, n_neighbors, p_dropout):
+        """
+        n_encoder_layers: number of encoder layers for modules using transformer encoders at their core.
+        """
+        super().__init__()
+
+        d_msa = 384
+        d_pair = 288
+        d_node = 64
+        d_edge = 64
+        d_state = 32
+
+        self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
+            d_emb=d_msa,
+            d_ff=d_msa * 4,
+            n_heads=12,
+            n_encoder_layers=n_encoder_layers,
+            p_dropout=p_dropout,
+        )
+
+        self.pair_update_with_msa = PairUpdateWithMsa(
+            d_pair=d_pair,
+            n_heads=12,
+            d_emb=d_msa,
+            d_proj=32,
+        )
+
+        self.pair_update_with_axial_attention = PairUpdateWithAxialAttention(
+            d_pair=d_pair,
+            d_ff=d_pair * 4,
+            n_heads=8,
+            p_dropout=p_dropout,
+            n_encoder_layers=n_encoder_layers,
+            performer_kws={},
+        )
+
+        self.msa_update_with_pair = MsaUpdateWithPair(
+            d_emb=d_msa,
+            d_pair=d_pair,
+            n_heads=4,
+            n_encoder_layers=n_encoder_layers,
+            p_dropout=0.1,
+        )
+
+        self.coord_update_with_msa_and_pair = CoordUpdateWithMsaAndPair(
+            d_emb=d_msa,
+            d_pair=d_pair,
+            d_node=d_node,
+            d_edge=d_edge,
+            d_state=d_state,
+            n_neighbors=n_neighbors,
+            p_dropout=p_dropout,
+        )
+
+        self.plddt_head = nn.Linear(d_state, 1)
+
+    def forward(self, msa, pair, xyz, seq_onehot, aa_idx):
+        msa, att = self.msa_update_using_self_att(msa)
+        pair = self.pair_update_with_msa(msa, pair, att)
+        pair = self.pair_update_with_axial_attention(pair)
+        msa = self.msa_update_with_pair(msa, pair)
+
+        state, xyz = self.coord_update_with_msa_and_pair(xyz, msa, pair, aa_idx, seq_onehot)
+
+        plddt = self.plddt_head(state)
+        plddt = rearrange(plddt, "b n () -> b n")
+
+        return msa, pair, xyz, plddt
+
+
 class RoseTTAFold(pl.LightningModule):
     def __init__(
         self,
         d_input=21,
+        n_two_track_blocks=3,
+        n_three_track_blocks=4,
+        n_encoder_layers=4,
         max_len=5000,
-        n_neighbors=128,
+        n_neighbors=[128, 128, 64, 64, 64],
         p_dropout=0.1,
+        use_template=False,
     ):
         super().__init__()
+
+        # parameters
+        self.use_template = use_template
 
         self.msa_emb = MsaEmbedding(
             d_input=d_input,
             d_emb=384,
             max_len=max_len,
             p_pe_drop=p_dropout,
+        )
+
+        self.pair_emb = PairEmbedding(
+            d_input=d_input,
+            d_emb=384,
+            max_len=max_len,
+            use_template=use_template,
+            p_pe_drop=p_dropout,
+        )
+
+        self.two_track_blocks = nn.ModuleList(
+            [
+                TwoTrackBlock(
+                    n_encoder_layers=n_encoder_layers,
+                    p_dropout=p_dropout,
+                )
+                for _ in range(n_two_track_blocks)
+            ]
         )
 
         self.initial_coord_generation_with_msa_and_pair = InitialCoordGenerationWithMsaAndPair(
@@ -1016,8 +1179,38 @@ class RoseTTAFold(pl.LightningModule):
             p_dropout=p_dropout,
         )
 
+        self.three_track_blocks = nn.ModuleList(
+            [
+                ThreeTrackBlock(
+                    n_encoder_layers=n_encoder_layers,
+                    n_neighbors=n_neighbors[i],
+                    p_dropout=p_dropout,
+                )
+                for i in range(n_three_track_blocks - 1)
+            ]
+        )
+
+        self.final_block = FinalBlock(
+            n_encoder_layers=n_encoder_layers,
+            n_neighbors=n_neighbors[-1],
+            p_dropout=p_dropout,
+        )
+
+        self.coordinate_prediction_head = nn.Linear(32, 3)
+
     def forward(self, msa, pair, seq_onehot, aa_idx):
+        msa = self.msa_emb(msa, aa_idx)
+        pair = self.pair_emb(pair, aa_idx)
+
+        for two_track_block in self.two_track_blocks:
+            msa, pair = two_track_block(msa, pair, seq_onehot, aa_idx)
+
         xyz = self.initial_coord_generation_with_msa_and_pair(msa, pair, seq_onehot, aa_idx)
+
+        for three_track_block in self.three_track_blocks:
+            msa, pair, xyz = three_track_block(msa, pair, xyz, seq_onehot, aa_idx)
+        
+        msa, pair, xyz, plddt = self.final_block(msa, pair, xyz, seq_onehot, aa_idx)
 
     def training_step(self, batch, batch_idx):
         pass

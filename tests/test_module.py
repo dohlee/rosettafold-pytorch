@@ -26,6 +26,7 @@ from rosettafold_pytorch.rosettafold_pytorch import (
     MsaUpdateWithPairAndCoord,
     TwoTrackBlock,
     ThreeTrackBlock,
+    FinalBlock,
     RoseTTAFold,
 )
 
@@ -377,6 +378,7 @@ def test_PairUpdateWithAxialAttention_init():
         d_pair=d_pair,
         d_ff=d_pair * 4,
         n_heads=n_heads,
+        n_encoder_layers=4,
         p_dropout=0.1,
     )
 
@@ -390,6 +392,7 @@ def test_PairUpdateWithAxialAttention_shape():
         d_pair=d_pair,
         d_ff=d_pair * 4,
         n_heads=n_heads,
+        n_encoder_layers=4,
         p_dropout=0.1,
     )
 
@@ -625,7 +628,10 @@ def test_MsaUpdateWithPairAndCoord_shape():
 def test_TwoTrackBlock_init():
     p_dropout = 0.1
 
-    block = TwoTrackBlock(p_dropout=p_dropout)
+    block = TwoTrackBlock(
+        n_encoder_layers=4,
+        p_dropout=p_dropout,
+    )
 
     assert block is not None
 
@@ -637,7 +643,10 @@ def test_TwoTrackBlock_shape():
     msa = torch.randn(bsz, n_seq, max_len, d_emb)
     pair = torch.randn(bsz, max_len, max_len, d_pair)
 
-    block = TwoTrackBlock(p_dropout=0.1)
+    block = TwoTrackBlock(
+        n_encoder_layers=4,
+        p_dropout=0.1,
+    )
     msa, pair = block(msa, pair)
 
     assert msa.shape == (bsz, n_seq, max_len, d_emb)
@@ -650,6 +659,7 @@ def test_ThreeTrackBlock_init():
     n_neighbors = 128
 
     block = ThreeTrackBlock(
+        n_encoder_layers=4,
         n_neighbors=n_neighbors,
         p_dropout=p_dropout,
     )
@@ -669,6 +679,7 @@ def test_ThreeTrackBlock_shape():
     seq_onehot = F.one_hot(torch.randint(0, 21, (bsz, max_len)), num_classes=21).float()
 
     block = ThreeTrackBlock(
+        n_encoder_layers=4,
         n_neighbors=n_neighbors,
         p_dropout=p_dropout,
     )
@@ -677,3 +688,41 @@ def test_ThreeTrackBlock_shape():
     assert msa.shape == (bsz, n_seq, max_len, d_emb)
     assert pair.shape == (bsz, max_len, max_len, d_pair)
     assert xyz.shape == (bsz, max_len, 3, 3)
+
+
+# FinalBlock
+def test_FinalBlock_init():
+    p_dropout = 0.1
+    n_neighbors = 128
+
+    block = FinalBlock(
+        n_encoder_layers=4,
+        n_neighbors=n_neighbors,
+        p_dropout=p_dropout,
+    )
+
+    assert block is not None
+
+
+def test_FinalBlock_shape():
+    d_emb, d_pair = 384, 288
+    bsz, n_seq, max_len = 4, 10, 64
+    n_neighbors, p_dropout = 128, 0.1
+
+    msa = torch.randn(bsz, n_seq, max_len, d_emb)
+    pair = torch.randn(bsz, max_len, max_len, d_pair)
+    xyz = torch.randn(bsz, max_len, 3, 3)
+    aa_idx = torch.randint(0, max_len, (bsz, max_len))
+    seq_onehot = F.one_hot(torch.randint(0, 21, (bsz, max_len)), num_classes=21).float()
+
+    block = FinalBlock(
+        n_encoder_layers=4,
+        n_neighbors=n_neighbors,
+        p_dropout=p_dropout,
+    )
+    msa, pair, xyz, plddt = block(msa, pair, xyz, seq_onehot, aa_idx)
+
+    assert msa.shape == (bsz, n_seq, max_len, d_emb)
+    assert pair.shape == (bsz, max_len, max_len, d_pair)
+    assert xyz.shape == (bsz, max_len, 3, 3)
+    assert plddt.shape == (bsz, max_len)
