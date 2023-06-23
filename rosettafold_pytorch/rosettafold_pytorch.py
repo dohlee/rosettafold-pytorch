@@ -53,6 +53,55 @@ class RowWise(nn.Module):
         return x
 
 
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, dim, max_len, p_dropout=0.1):
+        super().__init__()
+        self.dim = dim
+        self.max_len = max_len
+
+        self.pos_enc = torch.zeros(max_len, dim)
+        denom = torch.exp(math.log(10000.0) * torch.arange(0, dim, 2) / dim)
+
+        pos = torch.arange(0, max_len).view(-1, 1)
+        self.pos_enc[:, 0::2] = torch.sin(pos / denom)
+        self.pos_enc[:, 1::2] = torch.cos(pos / denom)
+
+        self.dropout = nn.Dropout(p_dropout)
+
+    def forward(self, x, aa_idx):
+        pe = torch.stack([self.pos_enc[idx] for idx in aa_idx])
+        print(x.shape, pe.shape)
+
+        return self.dropout(x + pe)
+
+
+class SinusoidalPositionalEncoding2D(nn.Module):
+    def __init__(self, dim, max_len, p_dropout=0.1):
+        super().__init__()
+
+        dim_half = dim // 2
+        self.max_len = max_len
+
+        self.pos_enc = torch.zeros(max_len, dim_half)
+        denom = torch.exp(math.log(10000.0) * torch.arange(0, dim_half, 2) / dim_half)
+
+        pos = torch.arange(0, max_len).view(-1, 1)
+        self.pos_enc[:, 0::2] = torch.sin(pos / denom)
+        self.pos_enc[:, 1::2] = torch.cos(pos / denom)
+
+        self.dropout = nn.Dropout(p_dropout)
+
+    def forward(self, x, aa_idx):
+        L = aa_idx.size(1)
+        # aa_idx : bsz x L
+        pe_half = torch.stack([self.pos_enc[idx] for idx in aa_idx])  # bsz x L x dim_half
+
+        pe_rowwise = repeat(pe_half, "b l d -> b l k d", k=L)
+        pe_colwise = repeat(pe_half, "b l d -> b k l d", k=L)
+
+        return x + torch.cat([pe_rowwise, pe_colwise], dim=-1)
+
+
 def sinusoidal_positional_encoding(max_len, d_emb):
     # Sinusoidal positional encoding
     # PE(pos, 2i) = sin(pos / 10000^(2i/d_emb))
@@ -67,24 +116,81 @@ def sinusoidal_positional_encoding(max_len, d_emb):
 
 
 class MsaEmbedding(nn.Module):
-    def __init__(self, d_input=21, d_emb=64, max_len=5000, p_pe_drop=0.1):
+    def __init__(self, d_input=21, d_emb=384, max_len=260, p_pe_drop=0.1):
         super().__init__()
         self.to_embedding = nn.Embedding(d_input, d_emb)
 
-        self.pos_enc = sinusoidal_positional_encoding(max_len, d_emb)
-        self.pos_enc_drop = nn.Dropout(p_pe_drop)
-
+        self.pos_enc = SinusoidalPositionalEncoding(d_emb, max_len, p_pe_drop)
         self.query_enc = nn.Embedding(2, d_emb)  # 0: query, 1: targets
 
-    def forward(self, x):
+    def forward(self, x, aa_idx):
         query_idx = torch.ones(x.size(-2), 1).long()
         query_idx[0] = 0
 
-        pe, qe = self.pos_enc_drop(self.pos_enc), self.query_enc(query_idx)
-
         # x : B, N, L
-        x = self.to_embedding(x) + pe + qe
+        x = self.pos_enc(self.to_embedding(x), aa_idx) + self.query_enc(query_idx)
         return x  # B, N, L, d_emb
+
+
+class PairEmbedding(nn.Module):
+    def __init__(
+        self,
+        d_input=21,
+        d_emb=288,
+        max_len=260,
+        p_pe_drop=0.1,
+        use_template=False,
+        d_template=64,
+    ):
+        super().__init__()
+        self.half_d_emb = d_emb // 2
+
+        self.embed_seq = nn.Embedding(d_input, self.half_d_emb)
+
+        self.pos_enc = SinusoidalPositionalEncoding2D(d_emb, max_len, p_pe_drop)
+
+        self.use_template = use_template
+        if self.use_template:
+            self.ln_template = nn.LayerNorm(d_template)
+            self.proj = nn.Linear(d_emb + d_template + 1, d_emb)
+        else:
+            self.proj = nn.Linear(d_emb + 1, d_emb)
+
+    def forward(self, seq, aa_idx, template=None):
+        if not self.use_template and template is not None:
+            raise ValueError(
+                f"[{self.__class__.__name__}]: template is not None but use_template is False"
+            )
+
+        L = seq.size(-1)
+
+        seq_emb = self.embed_seq(seq)  # B, L, d_emb/2
+        left_seq_emb = repeat(seq_emb, "b l d -> b k l d", k=L)
+        right_seq_emb = repeat(seq_emb, "b l d -> b l k d", k=L)
+        seq_sep = self._sequence_separation_matrix(aa_idx)
+
+        if self.use_template:
+            x = torch.cat(
+                [
+                    left_seq_emb,
+                    right_seq_emb,
+                    seq_sep,
+                    self.ln_template(template),
+                ],
+                dim=-1,
+            )
+        else:
+            x = torch.cat([left_seq_emb, right_seq_emb, seq_sep], dim=-1)  # B, L, L, d_emb+1
+
+        x = self.proj(x)  # B, L, L, d_emb
+
+        return self.pos_enc(x, aa_idx)
+
+    def _sequence_separation_matrix(self, aa_idx):
+        dist = aa_idx.unsqueeze(-1) - aa_idx.unsqueeze(-2)  # All-pairwise diff
+        dist = torch.log(torch.abs(dist) + 1)
+
+        return rearrange(dist, "b i j -> b i j ()")
 
 
 class PositionWiseWeightFactor(nn.Module):
