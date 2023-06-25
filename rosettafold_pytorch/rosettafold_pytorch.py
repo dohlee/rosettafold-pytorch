@@ -934,65 +934,11 @@ class MsaUpdateWithPairAndCoord(nn.Module):
 
 
 class TwoTrackBlock(nn.Module):
-    def __init__(self, n_encoder_layers, p_dropout=0.1):
+    def __init__(self, d_msa, d_pair, n_encoder_layers, p_dropout=0.1):
         """
         n_encoder_layers: number of encoder layers for modules using transformer encoders at their core.
         """
         super().__init__()
-
-        self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
-            d_emb=384,
-            d_ff=384 * 4,
-            n_heads=12,
-            n_encoder_layers=n_encoder_layers,
-            p_dropout=p_dropout,
-        )
-
-        self.pair_update_with_msa = PairUpdateWithMsa(
-            d_pair=288,
-            n_heads=12,
-            d_emb=384,
-            d_proj=32,
-        )
-
-        self.pair_update_with_axial_attention = PairUpdateWithAxialAttention(
-            d_pair=288,
-            d_ff=288 * 4,
-            n_heads=8,
-            p_dropout=p_dropout,
-            n_encoder_layers=n_encoder_layers,
-            performer_kws={},
-        )
-
-        self.msa_update_with_pair = MsaUpdateWithPair(
-            d_emb=384,
-            d_pair=288,
-            n_heads=4,
-            n_encoder_layers=n_encoder_layers,
-            p_dropout=0.1,
-        )
-
-    def forward(self, msa, pair):
-        msa, att = self.msa_update_using_self_att(msa)
-        pair = self.pair_update_with_msa(msa, pair, att)
-        pair = self.pair_update_with_axial_attention(pair)
-        msa = self.msa_update_with_pair(msa, pair)
-
-        return msa, pair
-
-
-class ThreeTrackBlock(nn.Module):
-    def __init__(self, n_encoder_layers, n_neighbors, p_dropout):
-        """
-        n_encoder_layers: number of encoder layers for modules using transformer encoders at their core.
-        """
-        super().__init__()
-
-        d_msa = 384
-        d_pair = 288
-        d_node = 64
-        d_edge = 64
-        d_state = 32
 
         self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
             d_emb=d_msa,
@@ -1019,7 +965,63 @@ class ThreeTrackBlock(nn.Module):
         )
 
         self.msa_update_with_pair = MsaUpdateWithPair(
-            d_emb=384,
+            d_emb=d_msa,
+            d_pair=d_pair,
+            n_heads=4,
+            n_encoder_layers=n_encoder_layers,
+            p_dropout=p_dropout,
+        )
+
+    def forward(self, msa, pair):
+        msa, att = self.msa_update_using_self_att(msa)
+        pair = self.pair_update_with_msa(msa, pair, att)
+        pair = self.pair_update_with_axial_attention(pair)
+        msa = self.msa_update_with_pair(msa, pair)
+
+        return msa, pair
+
+
+class ThreeTrackBlock(nn.Module):
+    def __init__(
+        self, d_msa, d_pair, d_node, d_edge, d_state, n_encoder_layers, n_neighbors, p_dropout
+    ):
+        """
+        n_encoder_layers: number of encoder layers for modules using transformer encoders at their core.
+        """
+        super().__init__()
+
+        # d_msa = 384
+        # d_pair = 288
+        # d_node = 64
+        # d_edge = 64
+        # d_state = 32
+
+        self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
+            d_emb=d_msa,
+            d_ff=d_msa * 4,
+            n_heads=12,
+            n_encoder_layers=n_encoder_layers,
+            p_dropout=p_dropout,
+        )
+
+        self.pair_update_with_msa = PairUpdateWithMsa(
+            d_pair=d_pair,
+            n_heads=12,
+            d_emb=d_msa,
+            d_proj=32,
+        )
+
+        self.pair_update_with_axial_attention = PairUpdateWithAxialAttention(
+            d_pair=d_pair,
+            d_ff=d_pair * 4,
+            n_heads=8,
+            p_dropout=p_dropout,
+            n_encoder_layers=n_encoder_layers,
+            performer_kws={},
+        )
+
+        self.msa_update_with_pair = MsaUpdateWithPair(
+            d_emb=d_msa,
             d_pair=d_pair,
             n_heads=4,
             n_encoder_layers=n_encoder_layers,
@@ -1031,14 +1033,14 @@ class ThreeTrackBlock(nn.Module):
             d_pair=d_pair,
             d_node=d_node,
             d_edge=d_edge,
-            d_state=32,
+            d_state=d_state,
             n_neighbors=n_neighbors,
             p_dropout=p_dropout,
         )
 
         self.msa_update_with_pair_and_coord = MsaUpdateWithPairAndCoord(
             d_emb=d_msa,
-            d_state=32,
+            d_state=d_state,
             d_trfm_inner=32,
             d_ff=d_msa * 4,
             distance_bins=[8, 12, 16, 20],
@@ -1058,17 +1060,19 @@ class ThreeTrackBlock(nn.Module):
 
 
 class FinalBlock(nn.Module):
-    def __init__(self, n_encoder_layers, n_neighbors, p_dropout):
+    def __init__(
+        self, d_msa, d_pair, d_node, d_edge, d_state, n_encoder_layers, n_neighbors, p_dropout
+    ):
         """
         n_encoder_layers: number of encoder layers for modules using transformer encoders at their core.
         """
         super().__init__()
 
-        d_msa = 384
-        d_pair = 288
-        d_node = 64
-        d_edge = 64
-        d_state = 32
+        # d_msa = 384
+        # d_pair = 288
+        # d_node = 64
+        # d_edge = 64
+        # d_state = 32
 
         self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
             d_emb=d_msa,
@@ -1141,15 +1145,17 @@ class PredictionHead(nn.Module):
         )
 
         self.dist_head = ResNet(
-            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout
+            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout=p_dropout
         )
         self.omega_head = ResNet(
-            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout
+            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout=p_dropout
         )
         self.theta_head = ResNet(
-            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout
+            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout=p_dropout
         )
-        self.phi_head = ResNet(n_res_blocks, in_channels, intermediate_channels, 19, p_dropout)
+        self.phi_head = ResNet(
+            n_res_blocks, in_channels, intermediate_channels, 19, p_dropout=p_dropout
+        )
 
     def forward(self, pair):
         pair = self.proj(pair)
@@ -1175,6 +1181,7 @@ class RoseTTAFold(pl.LightningModule):
         d_pair=288,
         d_node=64,
         d_edge=64,
+        d_state=32,
         n_two_track_blocks=3,
         n_three_track_blocks=4,
         n_encoder_layers=4,
@@ -1188,6 +1195,12 @@ class RoseTTAFold(pl.LightningModule):
         # parameters
         self.d_msa = d_msa
         self.d_pair = d_pair
+        self.d_node = d_node
+        self.d_edge = d_edge
+        self.d_state = d_state
+        self.n_two_track_blocks = n_two_track_blocks
+        self.n_three_track_blocks = n_three_track_blocks
+        self.n_encoder_layers = n_encoder_layers
         self.use_template = use_template
 
         self.msa_emb = MsaEmbedding(
@@ -1208,6 +1221,8 @@ class RoseTTAFold(pl.LightningModule):
         self.two_track_blocks = nn.ModuleList(
             [
                 TwoTrackBlock(
+                    d_msa,
+                    d_pair,
                     n_encoder_layers=n_encoder_layers,
                     p_dropout=p_dropout,
                 )
@@ -1228,6 +1243,11 @@ class RoseTTAFold(pl.LightningModule):
         self.three_track_blocks = nn.ModuleList(
             [
                 ThreeTrackBlock(
+                    d_msa,
+                    d_pair,
+                    d_node,
+                    d_edge,
+                    d_state,
                     n_encoder_layers=n_encoder_layers,
                     n_neighbors=n_neighbors[i],
                     p_dropout=p_dropout,
@@ -1237,6 +1257,11 @@ class RoseTTAFold(pl.LightningModule):
         )
 
         self.final_block = FinalBlock(
+            d_msa,
+            d_pair,
+            d_node,
+            d_edge,
+            d_state,
             n_encoder_layers=n_encoder_layers,
             n_neighbors=n_neighbors[-1],
             p_dropout=p_dropout,
@@ -1246,9 +1271,11 @@ class RoseTTAFold(pl.LightningModule):
             in_channels=d_pair, n_res_blocks=4, p_dropout=p_dropout
         )
 
-    def forward(self, msa, pair, seq_onehot, aa_idx):
+    def forward(self, msa, seq, aa_idx):
         msa = self.msa_emb(msa, aa_idx)
-        pair = self.pair_emb(pair, aa_idx)
+        pair = self.pair_emb(seq, aa_idx)
+
+        seq_onehot = F.one_hot(seq, num_classes=21).float()
 
         for two_track_block in self.two_track_blocks:
             msa, pair = two_track_block(msa, pair, seq_onehot, aa_idx)

@@ -726,3 +726,71 @@ def test_FinalBlock_shape():
     assert pair.shape == (bsz, max_len, max_len, d_pair)
     assert xyz.shape == (bsz, max_len, 3, 3)
     assert plddt.shape == (bsz, max_len)
+
+
+# RoseTTAFold
+def test_RoseTTAFold_init():
+    bsz, n_seq, max_len = 4, 8, 64
+
+    d_msa = 384
+    d_pair = 288
+    d_node = 64
+    d_edge = 64
+    n_two_track_blocks = 3
+    n_three_track_blocks = 3
+
+    msa = torch.randn(bsz, n_seq, max_len, 21)
+    seq = torch.randint(0, 21, (bsz, max_len))
+    aa_idx = torch.randint(0, max_len, (bsz, max_len))
+
+    model = RoseTTAFold(
+        d_input=21,
+        d_msa=d_msa,
+        d_pair=d_pair,
+        d_node=64,
+        d_edge=64,
+        n_two_track_blocks=3,
+        n_three_track_blocks=4,
+        n_encoder_layers=4,
+        max_len=5000,
+        n_neighbors=[128, 128, 64, 64, 64],
+        p_dropout=0.1,
+        use_template=False,
+    )
+
+    assert model is not None
+
+
+def test_RoseTTAFold_shape():
+    bsz, n_seq, max_len = 4, 8, 64
+
+    msa = torch.randn(bsz, n_seq, max_len, 21)
+    seq = torch.randint(0, 21, (bsz, max_len))
+    aa_idx = torch.randint(0, max_len, (bsz, max_len))
+
+    model = RoseTTAFold(
+        d_input=21,
+        d_msa=384,
+        d_pair=288,
+        d_node=64,
+        d_edge=64,
+        d_state=32,
+        n_two_track_blocks=3,
+        n_three_track_blocks=4,
+        n_encoder_layers=4,
+        max_len=5000,
+        n_neighbors=[128, 128, 64, 64, 64],
+        p_dropout=0.1,
+        use_template=False,
+    )
+
+    logits, xyz, plddt = model(msa, seq, aa_idx)
+
+    assert len(logits) == 4
+    assert logits["theta"].shape == (bsz, max_len, 37)
+    assert logits["phi"].shape == (bsz, max_len, 19)
+    assert logits["dist"].shape == (bsz, max_len, 37)
+    assert logits["omega"].shape == (bsz, max_len, 37)
+
+    assert xyz.shape == (bsz, max_len, 3, 3)
+    assert plddt.shape == (bsz, max_len)
