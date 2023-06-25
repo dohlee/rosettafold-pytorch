@@ -9,6 +9,7 @@ from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 from performer_pytorch import SelfAttention as PerformerSelfAttention
 
+from .resnet import ResNet
 from .se3_modules import SE3Transformer
 
 N_IDX, CA_IDX, C_IDX = 0, 1, 2
@@ -1122,15 +1123,58 @@ class FinalBlock(nn.Module):
         state, xyz = self.coord_update_with_msa_and_pair(xyz, msa, pair, aa_idx, seq_onehot)
 
         plddt = self.plddt_head(state)
-        plddt = rearrange(plddt, "b n () -> b n")
+        plddt = rearrange(plddt, "b l () -> b l")
 
         return msa, pair, xyz, plddt
+
+
+class PredictionHead(nn.Module):
+    def __init__(self, in_channels, n_res_blocks, p_dropout):
+        super().__init__()
+
+        intermediate_channels = in_channels
+        self.proj = nn.Sequential(
+            nn.LayerNorm(in_channels),
+            nn.Linear(in_channels, intermediate_channels),
+            nn.Dropout(p_dropout),
+            Rearrange("b i j c -> b c i j"),
+        )
+
+        self.dist_head = ResNet(
+            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout
+        )
+        self.omega_head = ResNet(
+            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout
+        )
+        self.theta_head = ResNet(
+            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout
+        )
+        self.phi_head = ResNet(n_res_blocks, in_channels, intermediate_channels, 19, p_dropout)
+
+    def forward(self, pair):
+        pair = self.proj(pair)
+
+        logits = {}
+        # theta, phi
+        logits["theta"] = self.theta_head(pair)
+        logits["phi"] = self.phi_head(pair)
+
+        # dist, omega should be predicted with symmetrized pair embedding
+        pair_symmetrized = (pair + rearrange(pair, "b c i j -> b c j i")) * 0.5
+        logits["dist"] = self.dist_head(pair_symmetrized)
+        logits["omega"] = self.omega_head(pair_symmetrized)
+
+        return logits
 
 
 class RoseTTAFold(pl.LightningModule):
     def __init__(
         self,
         d_input=21,
+        d_msa=384,
+        d_pair=288,
+        d_node=64,
+        d_edge=64,
         n_two_track_blocks=3,
         n_three_track_blocks=4,
         n_encoder_layers=4,
@@ -1142,18 +1186,20 @@ class RoseTTAFold(pl.LightningModule):
         super().__init__()
 
         # parameters
+        self.d_msa = d_msa
+        self.d_pair = d_pair
         self.use_template = use_template
 
         self.msa_emb = MsaEmbedding(
             d_input=d_input,
-            d_emb=384,
+            d_emb=d_msa,
             max_len=max_len,
             p_pe_drop=p_dropout,
         )
 
         self.pair_emb = PairEmbedding(
             d_input=d_input,
-            d_emb=384,
+            d_emb=d_msa,
             max_len=max_len,
             use_template=use_template,
             p_pe_drop=p_dropout,
@@ -1170,10 +1216,10 @@ class RoseTTAFold(pl.LightningModule):
         )
 
         self.initial_coord_generation_with_msa_and_pair = InitialCoordGenerationWithMsaAndPair(
-            d_emb=384,
-            d_pair=288,
-            d_node=64,
-            d_edge=64,
+            d_emb=d_msa,
+            d_pair=d_pair,
+            d_node=d_node,
+            d_edge=d_edge,
             n_heads=4,
             n_layers=4,
             p_dropout=p_dropout,
@@ -1196,7 +1242,9 @@ class RoseTTAFold(pl.LightningModule):
             p_dropout=p_dropout,
         )
 
-        self.coordinate_prediction_head = nn.Linear(32, 3)
+        self.prediction_head = PredictionHead(
+            in_channels=d_pair, n_res_blocks=4, p_dropout=p_dropout
+        )
 
     def forward(self, msa, pair, seq_onehot, aa_idx):
         msa = self.msa_emb(msa, aa_idx)
@@ -1209,8 +1257,11 @@ class RoseTTAFold(pl.LightningModule):
 
         for three_track_block in self.three_track_blocks:
             msa, pair, xyz = three_track_block(msa, pair, xyz, seq_onehot, aa_idx)
-        
+
         msa, pair, xyz, plddt = self.final_block(msa, pair, xyz, seq_onehot, aa_idx)
+        logits = self.prediction_head(pair)
+
+        return logits, xyz, plddt
 
     def training_step(self, batch, batch_idx):
         pass
