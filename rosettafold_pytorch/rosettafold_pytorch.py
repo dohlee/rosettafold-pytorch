@@ -71,7 +71,7 @@ class SinusoidalPositionalEncoding(nn.Module):
 
     def forward(self, x, aa_idx):
         pe = torch.stack([self.pos_enc[idx] for idx in aa_idx])
-        print(x.shape, pe.shape)
+        pe = rearrange(pe, "b l d -> b () l d")
 
         return self.dropout(x + pe)
 
@@ -103,26 +103,13 @@ class SinusoidalPositionalEncoding2D(nn.Module):
         return x + torch.cat([pe_rowwise, pe_colwise], dim=-1)
 
 
-def sinusoidal_positional_encoding(max_len, d_emb):
-    # Sinusoidal positional encoding
-    # PE(pos, 2i) = sin(pos / 10000^(2i/d_emb))
-    # PE(pos, 2i+1) = cos(pos / 10000^(2i/d_emb))
-    pos_enc = torch.zeros(max_len, d_emb)
-    pos = torch.arange(0, max_len).view(-1, 1)
-    denom = torch.exp(math.log(10000.0) * torch.arange(0, d_emb, 2) / d_emb)
-
-    pos_enc[:, 0::2] = torch.sin(pos / denom)
-    pos_enc[:, 1::2] = torch.cos(pos / denom)
-    return pos_enc
-
-
 class MsaEmbedding(nn.Module):
-    def __init__(self, d_input=21, d_emb=384, max_len=260, p_pe_drop=0.1):
+    def __init__(self, d_input=21, d_msa=384, max_len=260, p_pe_drop=0.1):
         super().__init__()
-        self.to_embedding = nn.Embedding(d_input, d_emb)
+        self.to_embedding = nn.Embedding(d_input, d_msa)
 
-        self.pos_enc = SinusoidalPositionalEncoding(d_emb, max_len, p_pe_drop)
-        self.query_enc = nn.Embedding(2, d_emb)  # 0: query, 1: targets
+        self.pos_enc = SinusoidalPositionalEncoding(d_msa, max_len, p_pe_drop)
+        self.query_enc = nn.Embedding(2, d_msa)  # 0: query, 1: targets
 
     def forward(self, x, aa_idx):
         query_idx = torch.ones(x.size(-2), 1).long()
@@ -130,32 +117,32 @@ class MsaEmbedding(nn.Module):
 
         # x : B, N, L
         x = self.pos_enc(self.to_embedding(x), aa_idx) + self.query_enc(query_idx)
-        return x  # B, N, L, d_emb
+        return x  # B, N, L, d_msa
 
 
 class PairEmbedding(nn.Module):
     def __init__(
         self,
         d_input=21,
-        d_emb=288,
+        d_pair=288,
         max_len=260,
         p_pe_drop=0.1,
         use_template=False,
         d_template=64,
     ):
         super().__init__()
-        self.half_d_emb = d_emb // 2
+        self.half_d_pair = d_pair // 2
 
-        self.embed_seq = nn.Embedding(d_input, self.half_d_emb)
+        self.embed_seq = nn.Embedding(d_input, self.half_d_pair)
 
-        self.pos_enc = SinusoidalPositionalEncoding2D(d_emb, max_len, p_pe_drop)
+        self.pos_enc = SinusoidalPositionalEncoding2D(d_pair, max_len, p_pe_drop)
 
         self.use_template = use_template
         if self.use_template:
             self.ln_template = nn.LayerNorm(d_template)
-            self.proj = nn.Linear(d_emb + d_template + 1, d_emb)
+            self.proj = nn.Linear(d_pair + d_template + 1, d_pair)
         else:
-            self.proj = nn.Linear(d_emb + 1, d_emb)
+            self.proj = nn.Linear(d_pair + 1, d_pair)
 
     def forward(self, seq, aa_idx, template=None):
         if not self.use_template and template is not None:
@@ -165,7 +152,7 @@ class PairEmbedding(nn.Module):
 
         L = seq.size(-1)
 
-        seq_emb = self.embed_seq(seq)  # B, L, d_emb/2
+        seq_emb = self.embed_seq(seq)  # B, L, d_pair/2
         left_seq_emb = repeat(seq_emb, "b l d -> b k l d", k=L)
         right_seq_emb = repeat(seq_emb, "b l d -> b l k d", k=L)
         seq_sep = self._sequence_separation_matrix(aa_idx)
@@ -181,9 +168,9 @@ class PairEmbedding(nn.Module):
                 dim=-1,
             )
         else:
-            x = torch.cat([left_seq_emb, right_seq_emb, seq_sep], dim=-1)  # B, L, L, d_emb+1
+            x = torch.cat([left_seq_emb, right_seq_emb, seq_sep], dim=-1)  # B, L, L, d_pair+1
 
-        x = self.proj(x)  # B, L, L, d_emb
+        x = self.proj(x)  # B, L, L, d_pair
 
         return self.pos_enc(x, aa_idx)
 
@@ -195,28 +182,28 @@ class PairEmbedding(nn.Module):
 
 
 class PositionWiseWeightFactor(nn.Module):
-    def __init__(self, d_emb=384, n_heads=12, p_dropout=0.1):
+    def __init__(self, d_msa=384, n_heads=12, p_dropout=0.1):
         super().__init__()
 
         assert (
-            d_emb % n_heads == 0
-        ), f"[{self.__class__.__name__}]: d_emb ({d_emb}) must be divisible by n_heads ({n_heads})."
+            d_msa % n_heads == 0
+        ), f"[{self.__class__.__name__}]: d_msa ({d_msa}) must be divisible by n_heads ({n_heads})."
 
-        self.d_head = d_emb // n_heads
+        self.d_head = d_msa // n_heads
         self.scale = self.d_head ** (-0.5)
 
         self.to_q = nn.Sequential(
-            nn.Linear(d_emb, d_emb),  # IDEA: maybe we can use LinearNoBias here.
+            nn.Linear(d_msa, d_msa),  # IDEA: maybe we can use LinearNoBias here.
             Rearrange("b 1 l (h d) -> b l h 1 d", h=n_heads),
         )
         self.to_k = nn.Sequential(
-            nn.Linear(d_emb, d_emb),  # IDEA: maybe we can use LinearNoBias here.
+            nn.Linear(d_msa, d_msa),  # IDEA: maybe we can use LinearNoBias here.
             Rearrange("b N l (h d) -> b l h N d", h=n_heads),
         )
         self.dropout = nn.Dropout(p_dropout)
 
     def forward(self, msa_emb):
-        """msa : (B, N, L, d_emb)"""
+        """msa : (B, N, L, d_msa)"""
         query_seq = msa_emb[:, 0].unsqueeze(1)  # Take the first sequence as query.
 
         q = self.to_q(query_seq) * self.scale
@@ -231,28 +218,28 @@ class PositionWiseWeightFactor(nn.Module):
 
 
 class SoftTiedAttentionOverResidues(nn.Module):
-    def __init__(self, d_emb=384, n_heads=12, p_dropout=0.1, return_att=False):
+    def __init__(self, d_msa=384, n_heads=12, p_dropout=0.1, return_att=False):
         super().__init__()
         assert (
-            d_emb % n_heads == 0
-        ), f"[{self.__class__.__name__}]: d_emb ({d_emb}) must be divisible by n_heads ({n_heads})."
+            d_msa % n_heads == 0
+        ), f"[{self.__class__.__name__}]: d_msa ({d_msa}) must be divisible by n_heads ({n_heads})."
 
         self.n_heads = n_heads
-        self.d_head = d_emb // n_heads
+        self.d_head = d_msa // n_heads
         self.scale = self.d_head ** (-0.5)
         self.return_att = return_att
 
-        self.poswise_weight = PositionWiseWeightFactor(d_emb, n_heads, p_dropout)
+        self.poswise_weight = PositionWiseWeightFactor(d_msa, n_heads, p_dropout)
 
         # IDEA: maybe we can use LinearNoBias for the projections below.
-        self.to_q = nn.Linear(d_emb, d_emb)
-        self.to_k = nn.Linear(d_emb, d_emb)
-        self.to_v = nn.Linear(d_emb, d_emb)
-        self.to_out = nn.Linear(d_emb, d_emb)
+        self.to_q = nn.Linear(d_msa, d_msa)
+        self.to_k = nn.Linear(d_msa, d_msa)
+        self.to_v = nn.Linear(d_msa, d_msa)
+        self.to_out = nn.Linear(d_msa, d_msa)
         self.dropout = nn.Dropout(p_dropout)
 
     def forward(self, x):
-        """x : (B, N, L, d_emb)"""
+        """x : (B, N, L, d_msa)"""
         q = self.to_q(x)
         k = self.to_k(x)
         v = self.to_v(x)
@@ -297,7 +284,7 @@ class FeedForward(nn.Module):
 class EncoderLayer(nn.Module):
     def __init__(
         self,
-        d_emb=384,
+        d_msa=384,
         d_ff=384 * 4,
         n_heads=12,
         p_dropout=0.1,
@@ -313,7 +300,7 @@ class EncoderLayer(nn.Module):
         # define attention operation
         if self.tied:
             self.attn = SoftTiedAttentionOverResidues(
-                d_emb=d_emb,
+                d_msa=d_msa,
                 n_heads=n_heads,
                 p_dropout=p_dropout,
                 return_att=return_att,
@@ -324,7 +311,7 @@ class EncoderLayer(nn.Module):
                     "PerformerSelfAttention does not support return_att."
                 )
             self.attn = PerformerSelfAttention(
-                dim=d_emb,
+                dim=d_msa,
                 heads=n_heads,
                 dropout=p_dropout,
                 **performer_kws,
@@ -333,13 +320,13 @@ class EncoderLayer(nn.Module):
             raise NotImplementedError
 
         # define layers
-        self.ln = nn.LayerNorm(d_emb)
+        self.ln = nn.LayerNorm(d_msa)
         self.dropout = nn.Dropout(p_dropout)
 
         self.ff = Residual(
             nn.Sequential(
-                nn.LayerNorm(d_emb),
-                FeedForward(d_emb, d_ff, p_dropout=p_dropout),
+                nn.LayerNorm(d_msa),
+                FeedForward(d_msa, d_ff, p_dropout=p_dropout),
                 nn.Dropout(p_dropout),
             )
         )
@@ -370,7 +357,7 @@ class EncoderLayer(nn.Module):
 class MsaUpdateUsingSelfAttention(nn.Module):
     def __init__(
         self,
-        d_emb=384,
+        d_msa=384,
         d_ff=384 * 4,
         n_heads=12,
         p_dropout=0.1,
@@ -382,7 +369,7 @@ class MsaUpdateUsingSelfAttention(nn.Module):
         self.residue_wise_encoder_layers = nn.ModuleList(
             [
                 EncoderLayer(
-                    d_emb=d_emb,
+                    d_msa=d_msa,
                     d_ff=d_ff,
                     n_heads=n_heads,
                     p_dropout=p_dropout,
@@ -397,7 +384,7 @@ class MsaUpdateUsingSelfAttention(nn.Module):
         self.sequence_wise_encoder_layers = nn.ModuleList(
             [
                 EncoderLayer(
-                    d_emb=d_emb,
+                    d_msa=d_msa,
                     d_ff=d_ff,
                     n_heads=n_heads,
                     p_dropout=p_dropout,
@@ -441,12 +428,12 @@ class OuterProductMean(nn.Module):
 
 
 class PairUpdateWithMsa(nn.Module):
-    def __init__(self, d_emb, d_proj, d_pair, n_heads, p_dropout=0.1):
+    def __init__(self, d_msa, d_proj, d_pair, n_heads, p_dropout=0.1):
         super().__init__()
 
         self.proj_msa = nn.Sequential(
-            nn.LayerNorm(d_emb),
-            nn.Linear(d_emb, d_proj),
+            nn.LayerNorm(d_msa),
+            nn.Linear(d_msa, d_proj),
             nn.LayerNorm(d_proj),
         )
         self.poswise_weight = PositionWiseWeightFactor(d_proj, 1, p_dropout)
@@ -570,7 +557,7 @@ class Symmetrization(nn.Module):
 
 
 class MsaUpdateWithPairLayer(nn.Module):
-    def __init__(self, d_emb, d_pair, n_heads, p_dropout=0.1):
+    def __init__(self, d_msa, d_pair, n_heads, p_dropout=0.1):
         super().__init__()
 
         self.pair2att = nn.Sequential(
@@ -583,15 +570,15 @@ class MsaUpdateWithPairLayer(nn.Module):
         )
 
         self.msa2value = nn.Sequential(
-            nn.LayerNorm(d_emb),
-            nn.Linear(d_emb, d_emb),
+            nn.LayerNorm(d_msa),
+            nn.Linear(d_msa, d_msa),
             Rearrange("b n j (h d) -> b n h j d", h=n_heads),
         )
 
         self.ff = Residual(
             nn.Sequential(
-                nn.LayerNorm(d_emb),
-                FeedForward(d_emb, d_emb, p_dropout),
+                nn.LayerNorm(d_msa),
+                FeedForward(d_msa, d_msa, p_dropout),
             ),
             p_dropout=p_dropout,
         )
@@ -609,11 +596,11 @@ class MsaUpdateWithPairLayer(nn.Module):
 
 
 class MsaUpdateWithPair(nn.Module):
-    def __init__(self, d_emb, d_pair, n_heads, n_encoder_layers=4, p_dropout=0.1):
+    def __init__(self, d_msa, d_pair, n_heads, n_encoder_layers=4, p_dropout=0.1):
         super().__init__()
 
         self.encoder_layers = [
-            MsaUpdateWithPairLayer(d_emb, d_pair, n_heads, p_dropout)
+            MsaUpdateWithPairLayer(d_msa, d_pair, n_heads, p_dropout)
             for _ in range(n_encoder_layers)
         ]
 
@@ -691,16 +678,16 @@ class GraphTransformerBlock(nn.Module):
 
 class InitialCoordGenerationWithMsaAndPair(nn.Module):
     def __init__(
-        self, d_emb, d_pair, d_node=64, d_edge=64, n_heads=4, n_layers=4, p_dropout=0.1
+        self, d_msa, d_pair, d_node=64, d_edge=64, n_heads=4, n_layers=4, p_dropout=0.1
     ):
         super().__init__()
 
-        self.ln_msa = nn.LayerNorm(d_emb)
+        self.ln_msa = nn.LayerNorm(d_msa)
         self.ln_pair = nn.LayerNorm(d_pair)
-        self.poswise_weight = PositionWiseWeightFactor(d_emb, 1, p_dropout)
+        self.poswise_weight = PositionWiseWeightFactor(d_msa, 1, p_dropout)
 
         self.node_embed = nn.Sequential(
-            nn.Linear(d_emb + 21, d_node),
+            nn.Linear(d_msa + 21, d_node),
             nn.ELU(),
         )
 
@@ -763,17 +750,17 @@ class InitialCoordGenerationWithMsaAndPair(nn.Module):
 
 
 class CoordUpdateWithMsaAndPair(nn.Module):
-    def __init__(self, d_emb, d_pair, d_node, d_edge, d_state, n_neighbors, p_dropout=0.1):
+    def __init__(self, d_msa, d_pair, d_node, d_edge, d_state, n_neighbors, p_dropout=0.1):
         super().__init__()
 
         self.n_neighbors = n_neighbors
 
-        self.ln_msa = nn.LayerNorm(d_emb)
+        self.ln_msa = nn.LayerNorm(d_msa)
         self.ln_pair = nn.LayerNorm(d_pair)
-        self.poswise_weight = PositionWiseWeightFactor(d_emb, 1, p_dropout)
+        self.poswise_weight = PositionWiseWeightFactor(d_msa, 1, p_dropout)
 
         self.node_embed = nn.Sequential(
-            nn.Linear(d_emb + 21, d_node),
+            nn.Linear(d_msa + 21, d_node),
             nn.ELU(),
             nn.LayerNorm(d_node),
         )
@@ -877,7 +864,7 @@ class CoordUpdateWithMsaAndPair(nn.Module):
 
 class MsaUpdateWithPairAndCoord(nn.Module):
     def __init__(
-        self, d_emb, d_state, d_trfm_inner, d_ff, distance_bins=[8, 12, 16, 20], p_dropout=0.1
+        self, d_msa, d_state, d_trfm_inner, d_ff, distance_bins=[8, 12, 16, 20], p_dropout=0.1
     ):
         super().__init__()
 
@@ -886,18 +873,18 @@ class MsaUpdateWithPairAndCoord(nn.Module):
 
         self.scale = (d_state // self.n_heads) ** -0.5
 
-        self.ln_msa = nn.LayerNorm(d_emb)
+        self.ln_msa = nn.LayerNorm(d_msa)
         self.ln_state = nn.LayerNorm(d_state)
 
         self.to_q = nn.Linear(d_state, d_trfm_inner * self.n_heads)
         self.to_k = nn.Linear(d_state, d_trfm_inner * self.n_heads)
-        self.to_v = nn.Linear(d_emb, d_emb)
+        self.to_v = nn.Linear(d_msa, d_msa)
 
-        self.ln_out = nn.LayerNorm(d_emb)
+        self.ln_out = nn.LayerNorm(d_msa)
         self.to_out = Residual(
             nn.Sequential(
-                nn.LayerNorm(d_emb),
-                FeedForward(d_emb, d_ff, p_dropout),
+                nn.LayerNorm(d_msa),
+                FeedForward(d_msa, d_ff, p_dropout),
             )
         )
 
@@ -941,7 +928,7 @@ class TwoTrackBlock(nn.Module):
         super().__init__()
 
         self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_ff=d_msa * 4,
             n_heads=12,
             n_encoder_layers=n_encoder_layers,
@@ -951,7 +938,7 @@ class TwoTrackBlock(nn.Module):
         self.pair_update_with_msa = PairUpdateWithMsa(
             d_pair=d_pair,
             n_heads=12,
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_proj=32,
         )
 
@@ -965,7 +952,7 @@ class TwoTrackBlock(nn.Module):
         )
 
         self.msa_update_with_pair = MsaUpdateWithPair(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_pair=d_pair,
             n_heads=4,
             n_encoder_layers=n_encoder_layers,
@@ -997,7 +984,7 @@ class ThreeTrackBlock(nn.Module):
         # d_state = 32
 
         self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_ff=d_msa * 4,
             n_heads=12,
             n_encoder_layers=n_encoder_layers,
@@ -1007,7 +994,7 @@ class ThreeTrackBlock(nn.Module):
         self.pair_update_with_msa = PairUpdateWithMsa(
             d_pair=d_pair,
             n_heads=12,
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_proj=32,
         )
 
@@ -1021,7 +1008,7 @@ class ThreeTrackBlock(nn.Module):
         )
 
         self.msa_update_with_pair = MsaUpdateWithPair(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_pair=d_pair,
             n_heads=4,
             n_encoder_layers=n_encoder_layers,
@@ -1029,7 +1016,7 @@ class ThreeTrackBlock(nn.Module):
         )
 
         self.coord_update_with_msa_and_pair = CoordUpdateWithMsaAndPair(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_pair=d_pair,
             d_node=d_node,
             d_edge=d_edge,
@@ -1039,7 +1026,7 @@ class ThreeTrackBlock(nn.Module):
         )
 
         self.msa_update_with_pair_and_coord = MsaUpdateWithPairAndCoord(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_state=d_state,
             d_trfm_inner=32,
             d_ff=d_msa * 4,
@@ -1061,7 +1048,15 @@ class ThreeTrackBlock(nn.Module):
 
 class FinalBlock(nn.Module):
     def __init__(
-        self, d_msa, d_pair, d_node, d_edge, d_state, n_encoder_layers, n_neighbors, p_dropout
+        self,
+        d_msa,
+        d_pair,
+        d_node,
+        d_edge,
+        d_state,
+        n_encoder_layers,
+        p_dropout,
+        n_neighbors=32,
     ):
         """
         n_encoder_layers: number of encoder layers for modules using transformer encoders at their core.
@@ -1075,7 +1070,7 @@ class FinalBlock(nn.Module):
         # d_state = 32
 
         self.msa_update_using_self_att = MsaUpdateUsingSelfAttention(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_ff=d_msa * 4,
             n_heads=12,
             n_encoder_layers=n_encoder_layers,
@@ -1085,7 +1080,7 @@ class FinalBlock(nn.Module):
         self.pair_update_with_msa = PairUpdateWithMsa(
             d_pair=d_pair,
             n_heads=12,
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_proj=32,
         )
 
@@ -1099,7 +1094,7 @@ class FinalBlock(nn.Module):
         )
 
         self.msa_update_with_pair = MsaUpdateWithPair(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_pair=d_pair,
             n_heads=4,
             n_encoder_layers=n_encoder_layers,
@@ -1107,7 +1102,7 @@ class FinalBlock(nn.Module):
         )
 
         self.coord_update_with_msa_and_pair = CoordUpdateWithMsaAndPair(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_pair=d_pair,
             d_node=d_node,
             d_edge=d_edge,
@@ -1144,17 +1139,21 @@ class PredictionHead(nn.Module):
             Rearrange("b i j c -> b c i j"),
         )
 
-        self.dist_head = ResNet(
-            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout=p_dropout
+        self.dist_head = nn.Sequential(
+            ResNet(n_res_blocks, in_channels, intermediate_channels, 37, p_dropout=p_dropout),
+            Rearrange("b c i j -> b i j c"),
         )
-        self.omega_head = ResNet(
-            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout=p_dropout
+        self.omega_head = nn.Sequential(
+            ResNet(n_res_blocks, in_channels, intermediate_channels, 37, p_dropout=p_dropout),
+            Rearrange("b c i j -> b i j c"),
         )
-        self.theta_head = ResNet(
-            n_res_blocks, in_channels, intermediate_channels, 37, p_dropout=p_dropout
+        self.theta_head = nn.Sequential(
+            ResNet(n_res_blocks, in_channels, intermediate_channels, 37, p_dropout=p_dropout),
+            Rearrange("b c i j -> b i j c"),
         )
-        self.phi_head = ResNet(
-            n_res_blocks, in_channels, intermediate_channels, 19, p_dropout=p_dropout
+        self.phi_head = nn.Sequential(
+            ResNet(n_res_blocks, in_channels, intermediate_channels, 19, p_dropout=p_dropout),
+            Rearrange("b c i j -> b i j c"),
         )
 
     def forward(self, pair):
@@ -1205,14 +1204,14 @@ class RoseTTAFold(pl.LightningModule):
 
         self.msa_emb = MsaEmbedding(
             d_input=d_input,
-            d_emb=d_msa,
+            d_msa=d_msa,
             max_len=max_len,
             p_pe_drop=p_dropout,
         )
 
         self.pair_emb = PairEmbedding(
             d_input=d_input,
-            d_emb=d_msa,
+            d_pair=d_pair,
             max_len=max_len,
             use_template=use_template,
             p_pe_drop=p_dropout,
@@ -1231,7 +1230,7 @@ class RoseTTAFold(pl.LightningModule):
         )
 
         self.initial_coord_generation_with_msa_and_pair = InitialCoordGenerationWithMsaAndPair(
-            d_emb=d_msa,
+            d_msa=d_msa,
             d_pair=d_pair,
             d_node=d_node,
             d_edge=d_edge,
@@ -1263,7 +1262,7 @@ class RoseTTAFold(pl.LightningModule):
             d_edge,
             d_state,
             n_encoder_layers=n_encoder_layers,
-            n_neighbors=n_neighbors[-1],
+            n_neighbors=32,  # fixed
             p_dropout=p_dropout,
         )
 
@@ -1274,11 +1273,10 @@ class RoseTTAFold(pl.LightningModule):
     def forward(self, msa, seq, aa_idx):
         msa = self.msa_emb(msa, aa_idx)
         pair = self.pair_emb(seq, aa_idx)
-
         seq_onehot = F.one_hot(seq, num_classes=21).float()
 
         for two_track_block in self.two_track_blocks:
-            msa, pair = two_track_block(msa, pair, seq_onehot, aa_idx)
+            msa, pair = two_track_block(msa, pair)
 
         xyz = self.initial_coord_generation_with_msa_and_pair(msa, pair, seq_onehot, aa_idx)
 
