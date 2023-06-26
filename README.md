@@ -51,6 +51,12 @@ xyz.shape # (bsz, max_len, 3, 3) : xyz coordinates for N, CA, C atoms
 plddt.shape # (bsz, max_len) : predicted lDDT score for each residue
 ```
 
+## References
+
+The official RoseTTAFold implementation : https://github.com/RosettaCommons/RoseTTAFold/tree/main
+
+The official SE(3)-Transformer implementation : https://github.com/FabianFuchsML/se3-transformer-public
+
 ## Citation
 ```bibtex
 @article{baek2021accurate,
